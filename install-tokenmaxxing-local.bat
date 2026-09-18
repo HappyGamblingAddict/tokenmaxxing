@@ -56,7 +56,7 @@ call bun run --cwd "%SOURCE_DIR%\apps\cli" build
 if errorlevel 1 goto :failed
 
 echo Installing tokenmaxxing globally...
-call npm install --global "%SOURCE_DIR%\apps\cli" --force --ignore-scripts
+cmd.exe /d /c npm install --global "%SOURCE_DIR%\apps\cli" --force --ignore-scripts
 if errorlevel 1 goto :failed
 
 echo.
