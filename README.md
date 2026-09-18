@@ -37,10 +37,28 @@
 
 ## Installation
 
+### Official Release
+
+This installs the latest official package published to npm:
+
 ```bash
 npm install -g @851-labs/tokenmaxxing@latest
 tokenmaxxing bootstrap
 ```
+
+### Windows Local Build
+
+To install the current `main` branch from the
+[HappyGamblingAddict/tokenmaxxing fork](https://github.com/HappyGamblingAddict/tokenmaxxing)
+globally on Windows, download and run
+[`install-tokenmaxxing-local.bat`](https://raw.githubusercontent.com/HappyGamblingAddict/tokenmaxxing/main/install-tokenmaxxing-local.bat).
+The script downloads the repository, installs Bun if it is missing, builds the
+CLI, and installs that build as the global `tokenmaxxing` command. Node.js/npm
+is required. No repository files need to be kept afterward.
+
+If you already have the repository checked out, run the same script from its
+root. For quick testing without changing the global command, use
+`tokenmaxxing-local.bat` instead.
 
 `bootstrap` signs you in, syncs the usage already on your machine, optionally
 installs automatic syncing, and opens your public profile.
