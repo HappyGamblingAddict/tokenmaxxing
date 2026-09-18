@@ -8,8 +8,10 @@ import type { CcusageSource } from "./sources";
 
 /**
  * Shells out to ccusage through npm on Windows because Bun can intermittently
- * omit ccusage's Windows optional native dependency. Bun remains the fallback
- * for Windows installations without npm and the primary runner elsewhere.
+ * omit ccusage's Windows optional native dependency. Windows uses cmd.exe so
+ * this also works when the CLI is running under Node rather than Bun. Bun
+ * remains the fallback for Windows installations without npm and the primary
+ * runner elsewhere.
  * Runner and report failures stay typed so the sync layer can distinguish them
  * from valid empty reports.
  */
@@ -205,7 +207,7 @@ function ccusageCommandInvocations(
 ): [CcusageCommandInvocation, CcusageCommandInvocation] {
   if (platform === "win32") {
     return [
-      { args: ["-y", CCUSAGE_SPEC, ...args], command: "npx.cmd" },
+      { args: ["/d", "/s", "/c", "npx.cmd", "-y", CCUSAGE_SPEC, ...args], command: "cmd.exe" },
       { args: ["x", CCUSAGE_SPEC, ...args], command: "bun" },
     ];
   }

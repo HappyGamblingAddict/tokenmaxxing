@@ -84,6 +84,8 @@ tokenmaxxing logout                        # Revoke this device's CLI token
 
 On Windows, run `tokenmaxxing-local.bat sync --dry-run` from this checkout to
 test the local CLI source without replacing the globally installed package.
+To install the local build globally so `tokenmaxxing` uses it from any folder,
+run `install-tokenmaxxing-local.bat` from this checkout.
 
 The background service supports macOS, Linux, and Windows. It uses the global
 `tokenmaxxing` binary and keeps itself current through the package manager that

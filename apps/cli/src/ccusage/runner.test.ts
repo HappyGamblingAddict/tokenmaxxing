@@ -95,7 +95,10 @@ describe("ccusage commands", () => {
 describe("ccusageCommandInvocations", () => {
   it("selects the Windows npm command shim", () => {
     expect(ccusageCommandInvocations(["codex", "daily"], "win32")).toEqual([
-      { args: ["-y", "ccusage@^20.0.19", "codex", "daily"], command: "npx.cmd" },
+      {
+        args: ["/d", "/s", "/c", "npx.cmd", "-y", "ccusage@^20.0.19", "codex", "daily"],
+        command: "cmd.exe",
+      },
       { args: ["x", "ccusage@^20.0.19", "codex", "daily"], command: "bun" },
     ]);
   });
@@ -118,7 +121,16 @@ describe("execCcusage", () => {
       ),
     ).resolves.toBe('{"daily":[]}');
     expect(run).toHaveBeenCalledOnce();
-    expect(run).toHaveBeenCalledWith("npx.cmd", ["-y", "ccusage@^20.0.19", "codex", "daily"]);
+    expect(run).toHaveBeenCalledWith("cmd.exe", [
+      "/d",
+      "/s",
+      "/c",
+      "npx.cmd",
+      "-y",
+      "ccusage@^20.0.19",
+      "codex",
+      "daily",
+    ]);
   });
 
   it("falls back to Bun when npm is missing on Windows", async () => {
@@ -138,13 +150,22 @@ describe("execCcusage", () => {
         execCcusage(["codex", "daily"], "codex", "daily", { platform: "win32", run }),
       ),
     ).resolves.toBe('{"daily":[]}');
-    expect(run).toHaveBeenNthCalledWith(1, "npx.cmd", ["-y", "ccusage@^20.0.19", "codex", "daily"]);
+    expect(run).toHaveBeenNthCalledWith(1, "cmd.exe", [
+      "/d",
+      "/s",
+      "/c",
+      "npx.cmd",
+      "-y",
+      "ccusage@^20.0.19",
+      "codex",
+      "daily",
+    ]);
     expect(run).toHaveBeenNthCalledWith(2, "bun", ["x", "ccusage@^20.0.19", "codex", "daily"]);
   });
 
   it("does not mask an npm execution failure with the Bun fallback", async () => {
     const failedNpm = new CcusageRunError({
-      cause: Object.assign(new Error("npx failed"), { code: 1 }),
+      cause: Object.assign(new Error("cmd.exe failed"), { code: 1 }),
       code: "command_failed",
       report: "daily",
       source: "codex",
