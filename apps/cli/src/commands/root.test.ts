@@ -22,6 +22,7 @@ describe("root command", () => {
     const result = runCli(["--help"]);
 
     expect(result.status).toBe(0);
+    expect(result.output).toContain("HappyGamblingAddict fork");
     expect(result.output).toContain(
       "bootstrap    Log in, sync usage, and optionally install automatic sync",
     );

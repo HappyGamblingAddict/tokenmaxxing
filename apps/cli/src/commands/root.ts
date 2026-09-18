@@ -11,7 +11,9 @@ import { upgradeCommand } from "./upgrade";
 import { whoamiCommand } from "./whoami";
 
 const tokenmaxxingCommand = Command.make("tokenmaxxing").pipe(
-  Command.withDescription("Sync your LLM token usage to the tokenmaxxing leaderboard"),
+  Command.withDescription(
+    "Sync your LLM token usage to the tokenmaxxing leaderboard (HappyGamblingAddict fork)",
+  ),
   Command.withGlobalFlags([verboseGlobalFlag]),
   Command.withSubcommands([
     bootstrapCommand,
