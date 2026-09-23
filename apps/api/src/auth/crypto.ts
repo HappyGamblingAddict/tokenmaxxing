@@ -79,10 +79,13 @@ function generateLoginCode(): string {
 
   while (chars.length < 8) {
     const byte = crypto.getRandomValues(new Uint8Array(1))[0];
-    if (byte >= maxUnbiasedByte) {
+    if (byte === undefined || byte >= maxUnbiasedByte) {
       continue;
     }
-    chars.push(LOGIN_CODE_ALPHABET[byte % alphabetLength]);
+    const char = LOGIN_CODE_ALPHABET[byte % alphabetLength];
+    if (char !== undefined) {
+      chars.push(char);
+    }
   }
 
   return `${chars.slice(0, 4).join("")}-${chars.slice(4).join("")}`;
