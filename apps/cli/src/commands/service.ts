@@ -15,7 +15,14 @@ import {
 } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { arch, homedir, hostname } from "node:os";
-import { basename, delimiter, dirname, join, posix as posixPath } from "node:path";
+import {
+  basename,
+  delimiter,
+  dirname,
+  join,
+  posix as posixPath,
+  win32 as win32Path,
+} from "node:path";
 import { promisify } from "node:util";
 import { gunzip } from "node:zlib";
 
@@ -3463,7 +3470,7 @@ function servicePaths({
     return null;
   }
 
-  const path = platform === "win32" ? { dirname, join } : posixPath;
+  const path = platform === "win32" ? win32Path : posixPath;
   const configDir = env["TOKENMAXXING_CONFIG_DIR"] ?? path.dirname(getConfigPath(env));
   const wrapperPath = path.join(
     configDir,
