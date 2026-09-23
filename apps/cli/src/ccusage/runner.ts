@@ -7,9 +7,13 @@ import { decodeDailyReport, decodeSessionReport } from "./schema";
 import type { CcusageSource } from "./sources";
 
 /**
- * Shells out to `bun x ccusage@^20.0.19 <source> daily --json --breakdown` (npx
- * fallback only when bun itself is missing). Runner and report failures stay
- * typed so the sync layer can distinguish them from valid empty reports.
+ * Shells out to ccusage through npm on Windows because Bun can intermittently
+ * omit ccusage's Windows optional native dependency. Windows uses cmd.exe so
+ * this also works when the CLI is running under Node rather than Bun. Bun
+ * remains the fallback for Windows installations without npm and the primary
+ * runner elsewhere.
+ * Runner and report failures stay typed so the sync layer can distinguish them
+ * from valid empty reports.
  */
 
 const CCUSAGE_SPEC = "ccusage@^20.0.19";
@@ -201,13 +205,18 @@ function ccusageCommandInvocations(
   args: string[],
   platform: NodeJS.Platform = process.platform,
 ): [CcusageCommandInvocation, CcusageCommandInvocation] {
+  if (platform === "win32") {
+    return [
+      { args: ["/d", "/s", "/c", "npx.cmd", "-y", CCUSAGE_SPEC, ...args], command: "cmd.exe" },
+      { args: ["x", CCUSAGE_SPEC, ...args], command: "bun" },
+    ];
+  }
+
   return [
     { args: ["x", CCUSAGE_SPEC, ...args], command: "bun" },
     {
       args: ["-y", CCUSAGE_SPEC, ...args],
-      // The published Windows CLI is Bun-compiled, whose execFile implementation
-      // can launch npm's command shim directly. A Node runtime would need cmd.exe.
-      command: platform === "win32" ? "npx.cmd" : "npx",
+      command: "npx",
     },
   ];
 }

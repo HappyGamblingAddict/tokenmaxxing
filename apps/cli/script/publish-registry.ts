@@ -11,7 +11,7 @@ async function packageVersionIsPublished(packageName: string, version: string): 
 }
 
 function npmRegistryPackageVersionUrl(packageName: string, version: string): string {
-  return `https://registry.npmjs.org/${packageName.replace("/", "%2F")}/${encodeURIComponent(version)}`;
+  return `https://registry.npmjs.org/${packageName.replaceAll("/", "%2F")}/${encodeURIComponent(version)}`;
 }
 
 export { npmRegistryPackageVersionUrl, packageVersionIsPublished };

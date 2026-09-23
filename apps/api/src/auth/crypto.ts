@@ -73,8 +73,17 @@ const LOGIN_CODE_ALPHABET = "ABCDEFGHJKMNPQRSTVWXYZ23456789";
 
 /** Readable device-flow code like "K3QF-W8MT". */
 function generateLoginCode(): string {
-  const bytes = crypto.getRandomValues(new Uint8Array(8));
-  const chars = [...bytes].map((byte) => LOGIN_CODE_ALPHABET[byte % LOGIN_CODE_ALPHABET.length]);
+  const chars: string[] = [];
+  const alphabetLength = LOGIN_CODE_ALPHABET.length;
+  const maxUnbiasedByte = Math.floor(256 / alphabetLength) * alphabetLength;
+
+  while (chars.length < 8) {
+    const byte = crypto.getRandomValues(new Uint8Array(1))[0];
+    if (byte >= maxUnbiasedByte) {
+      continue;
+    }
+    chars.push(LOGIN_CODE_ALPHABET[byte % alphabetLength]);
+  }
 
   return `${chars.slice(0, 4).join("")}-${chars.slice(4).join("")}`;
 }

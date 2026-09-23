@@ -2846,7 +2846,7 @@ function fetchServiceRunnerRelease(
 }
 
 function npmRegistryPackageUrl(packageName: string): string {
-  return `https://registry.npmjs.org/${packageName.replace("/", "%2F")}`;
+  return `https://registry.npmjs.org/${packageName.replaceAll("/", "%2F")}`;
 }
 
 function serviceRunnerReleaseFromPackageJson(
