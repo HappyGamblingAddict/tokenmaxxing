@@ -1,5 +1,5 @@
 import { Effect, Layer } from "effect";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 
 import { ConsoleService } from "./services";
 import { clackFailureForCliFailure, renderCliFailure } from "./errors";
@@ -251,5 +251,3 @@ describe("clackFailureForCliFailure", () => {
     });
   });
 });
-
-export {};

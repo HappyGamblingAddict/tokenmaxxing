@@ -3,32 +3,39 @@ import * as HttpApi from "effect/unstable/httpapi/HttpApi";
 import * as HttpApiEndpoint from "effect/unstable/httpapi/HttpApiEndpoint";
 import * as HttpApiGroup from "effect/unstable/httpapi/HttpApiGroup";
 
+import { DateKey } from "./date-key";
 import {
   AdminUserNotFound,
+  BadRequest,
+  CliUpgradeRequired,
   DeviceNotFound,
-  DeviceMissing,
   Forbidden,
   LoginCodeExpired,
   LoginCodeNotFound,
+  RouteNotFound,
+  TokenDeviceUnbound,
   TokenNotFound,
   UserNotFound,
 } from "./errors";
-import { Authorization, CliAuth } from "./middleware";
+import { AllowCliToken, Authorization, CliAuth, ErrorBoundary } from "./middleware";
 import {
   AdminUsersResponse,
   CliLoginApproveInput,
   CliLoginApproveResponse,
   CliLoginPollInput,
   CliLoginPollResponse,
+  CliLoginRequestSummary,
   CliLoginStartInput,
   CliLoginStartResponse,
-  CliTokenSummary,
-  DeviceSummary,
+  DeviceId,
   HealthResponse,
   IngestUsageInput,
   LeaderboardMetric,
   LeaderboardResponse,
   LeaderboardWindow,
+  ListAccountsResponse,
+  ListDevicesResponse,
+  ListTokensResponse,
   MeResponse,
   OkResponse,
   ProfileDailyGroupBy,
@@ -41,13 +48,15 @@ import {
   UsageCheckInResponse,
   SyncUsageInput,
   SyncUsageResponse,
-  UserAccountSummary,
+  TokenId,
+  UserId,
 } from "./schemas";
 
 /**
  * The whole HTTP contract, one group per domain. Authorization guards the
  * session-cookie surface (www), CliAuth guards the bearer-token surface
- * (CLI), and leaderboard/profiles stay public. The OAuth browser flow
+ * (CLI), and leaderboard/profiles stay public. ErrorBoundary wraps every
+ * endpoint (added last, so it is outermost). The OAuth browser flow
  * (redirects + Set-Cookie) lives in raw router routes, not here.
  */
 
@@ -59,13 +68,23 @@ class HealthGroup extends HttpApiGroup.make("health").add(
 
 class MeGroup extends HttpApiGroup.make("me")
   .add(
+    // The CLI's whoami/auth check; the only session endpoint a CLI token may call.
     HttpApiEndpoint.get("me", "/me", {
       success: MeResponse,
-    }),
+    }).annotate(AllowCliToken, true),
   )
   .add(
     HttpApiEndpoint.get("listAccounts", "/me/accounts", {
-      success: Schema.Struct({ accounts: Schema.Array(UserAccountSummary) }),
+      success: ListAccountsResponse,
+    }),
+  )
+  .add(
+    HttpApiEndpoint.get("describeCliLogin", "/cli/login/request", {
+      query: {
+        code: Schema.String,
+      },
+      success: CliLoginRequestSummary,
+      error: [LoginCodeNotFound, LoginCodeExpired],
     }),
   )
   .add(
@@ -77,13 +96,13 @@ class MeGroup extends HttpApiGroup.make("me")
   )
   .add(
     HttpApiEndpoint.get("listDevices", "/me/devices", {
-      success: Schema.Struct({ devices: Schema.Array(DeviceSummary) }),
+      success: ListDevicesResponse,
     }),
   )
   .add(
     HttpApiEndpoint.post("deleteDevice", "/me/devices/:deviceId/delete", {
       params: {
-        deviceId: Schema.String,
+        deviceId: DeviceId,
       },
       success: OkResponse,
       error: DeviceNotFound,
@@ -91,13 +110,13 @@ class MeGroup extends HttpApiGroup.make("me")
   )
   .add(
     HttpApiEndpoint.get("listTokens", "/me/tokens", {
-      success: Schema.Struct({ tokens: Schema.Array(CliTokenSummary) }),
+      success: ListTokensResponse,
     }),
   )
   .add(
     HttpApiEndpoint.post("revokeToken", "/me/tokens/:tokenId/revoke", {
       params: {
-        tokenId: Schema.String,
+        tokenId: TokenId,
       },
       success: OkResponse,
       error: TokenNotFound,
@@ -110,6 +129,7 @@ class CliLoginGroup extends HttpApiGroup.make("cliLogin")
     HttpApiEndpoint.post("start", "/cli/login/start", {
       payload: CliLoginStartInput,
       success: CliLoginStartResponse,
+      error: CliUpgradeRequired,
     }),
   )
   .add(
@@ -125,14 +145,14 @@ class UsageGroup extends HttpApiGroup.make("usage")
     HttpApiEndpoint.post("checkIn", "/usage/check-in", {
       payload: UsageCheckInInput,
       success: UsageCheckInResponse,
-      error: DeviceMissing,
+      error: TokenDeviceUnbound,
     }),
   )
   .add(
     HttpApiEndpoint.post("ingest", "/usage/ingest", {
       payload: IngestUsageInput,
       success: SyncUsageResponse,
-      error: DeviceMissing,
+      error: TokenDeviceUnbound,
     }),
   )
   .add(
@@ -141,7 +161,7 @@ class UsageGroup extends HttpApiGroup.make("usage")
     HttpApiEndpoint.post("sync", "/usage/sync", {
       payload: SyncUsageInput,
       success: SyncUsageResponse,
-      error: DeviceMissing,
+      error: TokenDeviceUnbound,
     }),
   )
   .add(
@@ -167,14 +187,25 @@ class StatsGroup extends HttpApiGroup.make("stats").add(
   }),
 ) {}
 
+/**
+ * `:login` comes straight from a profile URL. The router caps path params at
+ * 100 characters and answers longer ones with RouteNotFound before any
+ * handler runs, so each profile read declares it next to UserNotFound; an
+ * undeclared tag would not decode into a typed error on the client.
+ */
 class ProfilesGroup extends HttpApiGroup.make("profiles")
+  .add(
+    HttpApiEndpoint.get("list", "/profiles", {
+      success: Schema.Array(ProfileIdentityResponse),
+    }),
+  )
   .add(
     HttpApiEndpoint.get("identity", "/profiles/:login/identity", {
       params: {
         login: Schema.String,
       },
       success: ProfileIdentityResponse,
-      error: UserNotFound,
+      error: [UserNotFound, RouteNotFound],
     }),
   )
   .add(
@@ -183,7 +214,7 @@ class ProfilesGroup extends HttpApiGroup.make("profiles")
         login: Schema.String,
       },
       success: ProfileResponse,
-      error: UserNotFound,
+      error: [UserNotFound, RouteNotFound],
     }),
   )
   .add(
@@ -193,11 +224,12 @@ class ProfilesGroup extends HttpApiGroup.make("profiles")
       },
       query: {
         groupBy: Schema.optional(ProfileDailyGroupBy),
-        since: Schema.optional(Schema.String),
-        until: Schema.optional(Schema.String),
+        since: Schema.optional(DateKey),
+        until: Schema.optional(DateKey),
       },
       success: ProfileDailyResponse,
-      error: UserNotFound,
+      // BadRequest: `since` after the (ceiling-capped) `until`.
+      error: [UserNotFound, RouteNotFound, BadRequest],
     }),
   ) {}
 
@@ -211,7 +243,7 @@ class AdminGroup extends HttpApiGroup.make("admin")
   .add(
     HttpApiEndpoint.post("shadowBanUser", "/admin/users/:userId/shadow-ban", {
       params: {
-        userId: Schema.String,
+        userId: UserId,
       },
       success: ShadowBanUserResponse,
       error: [Forbidden, AdminUserNotFound],
@@ -220,7 +252,7 @@ class AdminGroup extends HttpApiGroup.make("admin")
   .add(
     HttpApiEndpoint.post("shadowUnbanUser", "/admin/users/:userId/shadow-unban", {
       params: {
-        userId: Schema.String,
+        userId: UserId,
       },
       success: ShadowBanUserResponse,
       error: [Forbidden, AdminUserNotFound],
@@ -236,7 +268,8 @@ class TokenmaxxingApi extends HttpApi.make("tokenmaxxing")
   .add(LeaderboardGroup)
   .add(StatsGroup)
   .add(ProfilesGroup)
-  .add(AdminGroup) {}
+  .add(AdminGroup)
+  .middleware(ErrorBoundary) {}
 
 export {
   AdminGroup,

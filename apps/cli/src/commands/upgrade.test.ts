@@ -1,5 +1,5 @@
 import { Effect, Layer } from "effect";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it } from "vite-plus/test";
 
 import { ConsoleService } from "../services";
 import type { CommandInstall } from "./service";
@@ -308,5 +308,3 @@ describe("formatUpgradeSuccess", () => {
     ).toBe("Upgraded tokenmaxxing");
   });
 });
-
-export {};

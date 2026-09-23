@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it } from "vite-plus/test";
 import type { UsageDayInput } from "@tokenmaxxing/api-contract";
 
 import { normalizeCcusageModelName, normalizeUsageDays } from "./models";
@@ -53,7 +53,7 @@ describe("normalizeUsageDays", () => {
   it("keeps identical model names separate across sources", () => {
     const rows = [
       usageDay({ model: "[pi] gpt-5.5" }),
-      usageDay({ model: "[openclaw] gpt-5.5", source: "openclaw" }),
+      usageDay({ model: "[hermes] gpt-5.5", source: "hermes" }),
     ];
 
     expect(normalizeUsageDays(rows)).toHaveLength(2);

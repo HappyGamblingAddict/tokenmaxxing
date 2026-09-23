@@ -1,6 +1,6 @@
 import { Cause, Effect, Layer, Option } from "effect";
-import type { AuthUser } from "@tokenmaxxing/api-contract";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { Unauthorized, UserId, type AuthUser } from "@tokenmaxxing/api-contract";
+import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 
 import {
   ApiClientService,
@@ -12,11 +12,14 @@ import {
   TerminalService,
   type TokenmaxxingApiClient,
 } from "../services";
+import { makeStubApiClient, type StubResponse } from "../testing/stub-api-client";
 import {
   AlreadyLoggedInError,
+  browserLoginEffect,
   loginEffect,
   LoginTokenInvalidError,
   LoginValidationError,
+  PollCliLoginError,
 } from "./login";
 
 const promptCalls = vi.hoisted((): string[] => []);
@@ -39,8 +42,11 @@ vi.mock("@clack/prompts", () => ({
 }));
 
 interface TestLayerOptions {
+  /** A real client (see makeStubApiClient) instead of the canned fake. */
+  client?: Effect.Effect<TokenmaxxingApiClient>;
   envTokenActive?: boolean;
   initialConfig: CliConfig;
+  interactive?: boolean;
   meError?: unknown;
 }
 
@@ -50,7 +56,7 @@ interface TestState {
 
 const user: AuthUser = {
   avatarUrl: null,
-  id: "user_123",
+  id: UserId.make("user_123"),
   login: "pondorasti",
   name: "Alexandru Turcanu",
 };
@@ -70,6 +76,9 @@ function makeTestLayer(options: TestLayerOptions) {
     Layer.succeed(ApiClientService)({
       make: (clientOptions) => {
         state.madeClients.push(clientOptions);
+        if (options.client !== undefined) {
+          return options.client;
+        }
 
         return Effect.succeed({
           me: {
@@ -94,7 +103,8 @@ function makeTestLayer(options: TestLayerOptions) {
           token: options.initialConfig.token,
           tokenCleared: options.initialConfig.token !== undefined,
         }),
-      ensureDeviceId: () => Effect.succeed(options.initialConfig.deviceId ?? "device_123"),
+      ensureDeviceId: () =>
+        Effect.succeed(options.initialConfig.deviceId ?? "0f1e2d3c-4b5a-4968-8776-a5b4c3d2e1f0"),
       hasEnvToken: () => Effect.succeed(options.envTokenActive ?? false),
       readConfig: () => Effect.succeed(options.initialConfig),
       writeToken: (token) => Effect.succeed({ ...options.initialConfig, token }),
@@ -105,7 +115,7 @@ function makeTestLayer(options: TestLayerOptions) {
     }),
     Layer.succeed(TerminalService)({
       canOpenExternalBrowser: Effect.succeed(false),
-      isInteractive: Effect.succeed(false),
+      isInteractive: Effect.succeed(options.interactive ?? false),
     }),
   );
 
@@ -113,7 +123,7 @@ function makeTestLayer(options: TestLayerOptions) {
 }
 
 function unauthorizedError() {
-  return Object.assign(new Error("unauthorized"), { _tag: "Unauthorized" as const });
+  return new Unauthorized({});
 }
 
 function setTty(value: boolean) {
@@ -289,4 +299,68 @@ describe("loginEffect", () => {
   });
 });
 
-export {};
+describe("browserLoginEffect poll failures", () => {
+  const startResponse: StubResponse = {
+    body: {
+      code: "ABCD-1234",
+      deviceCode: "device-code-secret",
+      expiresAt: "2026-06-21T18:10:00.000Z",
+      intervalSeconds: 0,
+      userCode: "ABCD-1234",
+      verificationUri: "https://tokenmaxxing.example/login/cli?code=ABCD-1234",
+    },
+    status: 200,
+  };
+
+  it.each<[string, StubResponse, string]>([
+    [
+      "an expired login code",
+      {
+        body: {
+          _tag: "LoginCodeExpired",
+          code: "ABCD-1234",
+          message: "Login code expired; run `tokenmaxxing login` again.",
+        },
+        status: 410,
+      },
+      "error: Login code expired; run `tokenmaxxing login` again.",
+    ],
+    [
+      "an unknown login code",
+      {
+        body: {
+          _tag: "LoginCodeNotFound",
+          code: "ABCD-1234",
+          message: "Login code not found; run `tokenmaxxing login` again.",
+        },
+        status: 404,
+      },
+      "error: Login code not found; run `tokenmaxxing login` again.",
+    ],
+    [
+      "a server failure",
+      { status: 500 },
+      "error: failed to poll CLI login\nhint: run tokenmaxxing login again",
+    ],
+  ])("surfaces %s", async (_label, pollResponse, message) => {
+    const { layer } = makeTestLayer({
+      client: makeStubApiClient({
+        "POST /cli/login/poll": pollResponse,
+        "POST /cli/login/start": startResponse,
+      }),
+      initialConfig: {
+        apiUrl: "https://api.tokenmaxxing.example",
+        wwwUrl: "https://tokenmaxxing.example",
+      },
+      interactive: true,
+    });
+
+    const exit = await Effect.runPromiseExit(
+      browserLoginEffect({ json: false }).pipe(Effect.provide(layer)),
+    );
+
+    const error = firstFailure(exit);
+    expect(error).toBeInstanceOf(PollCliLoginError);
+    expect(error.message).toBe(message);
+  });
+});

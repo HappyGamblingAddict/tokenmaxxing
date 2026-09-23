@@ -1,5 +1,8 @@
 import type { CSSProperties, ReactNode } from "react";
 
+import { cn } from "../../lib/cn";
+import type { TooltipRow } from "./series";
+
 /**
  * The shared hover tooltip for every dashboard chart: a floating card with a
  * title, optional subtitle, and optional colour-swatched rows. Presentational
@@ -7,12 +10,6 @@ import type { CSSProperties, ReactNode } from "react";
  * pointer-to-datum math differs per chart. Centralising the card keeps all
  * four charts visually identical.
  */
-
-interface TooltipRow {
-  color?: string;
-  label: string;
-  value: string;
-}
 
 /** Card width (rem) the anchored charts render at — kept in sync with the clamp. */
 const CARD_REM = 14;
@@ -55,7 +52,10 @@ function ChartTooltip({
 }) {
   return (
     <div
-      className={`pointer-events-none absolute top-0 z-10 border border-border bg-card p-3 text-xs shadow-lg ${className ?? ""}`}
+      className={cn(
+        "pointer-events-none absolute top-0 z-10 border border-border bg-card p-3 text-xs shadow-lg",
+        className,
+      )}
       style={style}
     >
       <p className="font-medium">{title}</p>
@@ -77,4 +77,17 @@ function ChartTooltip({
   );
 }
 
-export { anchorBesideBar, anchorLeft, ChartTooltip };
+/**
+ * Always-mounted polite live region around a chart's tooltip, so keyboard
+ * users hear the datum they move to. It is static (not positioned), so the
+ * tooltip still anchors to the chart's `relative` container.
+ */
+function ChartLiveRegion({ children }: { children: ReactNode }) {
+  return (
+    <div aria-atomic="true" aria-live="polite">
+      {children}
+    </div>
+  );
+}
+
+export { anchorBesideBar, anchorLeft, ChartLiveRegion, ChartTooltip };

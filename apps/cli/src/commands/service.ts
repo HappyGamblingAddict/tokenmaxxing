@@ -15,21 +15,29 @@ import {
 } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { arch, homedir, hostname } from "node:os";
-import { basename, delimiter, dirname, join } from "node:path";
+import {
+  basename,
+  delimiter,
+  dirname,
+  join,
+  posix as posixPath,
+  win32 as win32Path,
+} from "node:path";
 import { promisify } from "node:util";
 import { gunzip } from "node:zlib";
 
 import { Data, Effect, Option } from "effect";
 import { Command, Flag } from "effect/unstable/cli";
 import type {
-  ServiceAutoUpdateManagerValue,
-  ServiceAutoUpdateReasonValue,
-  ServiceAutoUpdateStatusValue,
-  ServiceCheckInStatusValue,
-  ServiceRepairReasonValue,
-  ServiceRepairStatusValue,
+  ServiceAutoUpdateManager,
+  ServiceAutoUpdateReason,
+  ServiceAutoUpdateStatus,
+  ServiceCheckInStatus,
+  ServiceRepairReason,
+  ServiceRepairStatus,
 } from "@tokenmaxxing/api-contract";
 
+import { booleanFlag } from "../flags";
 import { ClockService, ConfigService, ConsoleService } from "../services";
 import { getConfigPath } from "../services/config";
 import { humanFrame, humanLog, humanSpinner, writeJson } from "../output";
@@ -81,6 +89,17 @@ const SERVICE_VERSION_TIMEOUT_MS = 30 * 1000;
 const SERVICE_LOG_MAX_BYTES = 5 * 1024 * 1024;
 const SERVICE_LOG_ROTATIONS = 3;
 const USAGE_REPLACEMENT_BACKFILL_VERSION = 1;
+// Scheduled runs normally only re-send days since the last success, so usage
+// that changes for an already-synced day (a ccusage upgrade that starts
+// counting a new model, a source that failed while others succeeded, logs
+// copied in later) would never reach the server. Every few hours a scheduled
+// run re-sends a trailing window instead. Keep the default inside Claude
+// Code's 30-day transcript retention: re-sending a day whose logs were
+// partially pruned would lower it on the server.
+const SERVICE_RECONCILE_WINDOW_DAYS = 21;
+const SERVICE_RECONCILE_WINDOW_MAX_DAYS = 90;
+const SERVICE_RECONCILE_WINDOW_ENV = "TOKENMAXXING_SYNC_WINDOW_DAYS";
+const SERVICE_RECONCILE_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const NPM_LATEST_URL = "https://registry.npmjs.org/@851-labs%2Ftokenmaxxing/latest";
 const SERVICE_UPLOAD_RETRY_POLICY: UploadRetryPolicy = {
   attempts: 3,
@@ -189,9 +208,9 @@ interface ServiceAutoUpdateReport {
   error?: string | null | undefined;
   installedVersion?: string | null | undefined;
   latestVersion?: string | null | undefined;
-  manager: ServiceAutoUpdateManagerValue | null;
-  reason: ServiceAutoUpdateReasonValue | null;
-  status: ServiceAutoUpdateStatusValue;
+  manager: ServiceAutoUpdateManager | null;
+  reason: ServiceAutoUpdateReason | null;
+  status: ServiceAutoUpdateStatus;
 }
 
 interface ServiceAutoUpdateRuntime {
@@ -234,8 +253,8 @@ interface ServiceState {
   lastRepairAttemptAt?: string;
   lastRepairCompletedAt?: string;
   lastRepairError?: string;
-  lastRepairReason?: ServiceRepairReasonValue;
-  lastRepairStatus?: ServiceRepairStatusValue;
+  lastRepairReason?: ServiceRepairReason;
+  lastRepairStatus?: ServiceRepairStatus;
   lastRows?: number;
   lastSchedulerActive?: boolean;
   lastSince?: string;
@@ -243,6 +262,7 @@ interface ServiceState {
   lastSyncStatus?: SyncStatus;
   lastSuccessAt?: string;
   lastSuccessDate?: string;
+  lastReconcileAt?: string;
   lastUpserted?: number;
   reloadRequired?: boolean;
   usageReplacementBackfillVersion?: number;
@@ -278,12 +298,12 @@ interface ServiceCheckIn {
   repairAttemptedAt?: string | undefined;
   repairCompletedAt?: string | undefined;
   repairError?: string | undefined;
-  repairReason?: ServiceRepairReasonValue | undefined;
-  repairStatus?: ServiceRepairStatusValue | undefined;
+  repairReason?: ServiceRepairReason | undefined;
+  repairStatus?: ServiceRepairStatus | undefined;
   runnerTarget?: string | undefined;
   runnerVersion?: string | undefined;
   schedulerActive: boolean;
-  status: ServiceCheckInStatusValue;
+  status: ServiceCheckInStatus;
 }
 
 interface ServiceRunnerInstall {
@@ -305,8 +325,8 @@ interface ServiceRepairReport {
   attemptedAt: string;
   completedAt?: string | undefined;
   error?: string | undefined;
-  reason: ServiceRepairReasonValue;
-  status: ServiceRepairStatusValue;
+  reason: ServiceRepairReason;
+  status: ServiceRepairStatus;
 }
 
 type DoctorAuthConfig =
@@ -387,7 +407,7 @@ class ServiceRunnerPackageMissingError extends Data.TaggedError(
 class ServiceRunnerUpdateError extends Data.TaggedError("ServiceRunnerUpdateError")<{
   readonly cause: unknown;
   readonly reason: Extract<
-    ServiceAutoUpdateReasonValue,
+    ServiceAutoUpdateReason,
     "download-failed" | "integrity-mismatch" | "install-failed" | "platform-package-missing"
   >;
 }> {}
@@ -431,11 +451,11 @@ class ServiceRepairError extends Data.TaggedError("ServiceRepairError")<{
 const installCommand = Command.make(
   "install",
   {
-    force: Flag.boolean("force").pipe(
+    force: booleanFlag("force").pipe(
       Flag.withDescription("Deprecated; service install uses a managed runner"),
     ),
-    json: Flag.boolean("json").pipe(Flag.withDescription("Output machine-readable JSON")),
-    refresh: Flag.boolean("refresh").pipe(Flag.withHidden),
+    json: booleanFlag("json").pipe(Flag.withDescription("Output machine-readable JSON")),
+    refresh: booleanFlag("refresh").pipe(Flag.withHidden),
   },
   ({ force, json, refresh }) => serviceInstallEffect({ force, json, refresh }),
 ).pipe(Command.withDescription("Install automatic sync"));
@@ -443,7 +463,7 @@ const installCommand = Command.make(
 const uninstallCommand = Command.make(
   "uninstall",
   {
-    json: Flag.boolean("json").pipe(Flag.withDescription("Output machine-readable JSON")),
+    json: booleanFlag("json").pipe(Flag.withDescription("Output machine-readable JSON")),
   },
   ({ json }) => serviceUninstallEffect({ json }),
 ).pipe(Command.withDescription("Uninstall automatic sync"));
@@ -451,7 +471,7 @@ const uninstallCommand = Command.make(
 const statusCommand = Command.make(
   "status",
   {
-    json: Flag.boolean("json").pipe(Flag.withDescription("Output machine-readable JSON")),
+    json: booleanFlag("json").pipe(Flag.withDescription("Output machine-readable JSON")),
   },
   ({ json }) => serviceStatusEffect({ json }),
 ).pipe(Command.withDescription("Show automatic sync service status"));
@@ -459,7 +479,7 @@ const statusCommand = Command.make(
 const doctorCommand = Command.make(
   "doctor",
   {
-    json: Flag.boolean("json").pipe(Flag.withDescription("Output machine-readable JSON")),
+    json: booleanFlag("json").pipe(Flag.withDescription("Output machine-readable JSON")),
   },
   ({ json }) => serviceDoctorEffect({ json }),
 ).pipe(Command.withDescription("Check automatic sync service health"));
@@ -467,9 +487,9 @@ const doctorCommand = Command.make(
 const repairCommand = Command.make(
   "repair",
   {
-    deferred: Flag.boolean("deferred").pipe(Flag.withHidden),
-    json: Flag.boolean("json").pipe(Flag.withDescription("Output machine-readable JSON")),
-    reason: Flag.string("reason").pipe(Flag.optional, Flag.withHidden),
+    deferred: booleanFlag("deferred").pipe(Flag.withHidden),
+    json: booleanFlag("json").pipe(Flag.withDescription("Output machine-readable JSON")),
+    reason: Flag.String("reason").pipe(Flag.optional, Flag.withHidden),
   },
   ({ deferred, json, reason }) =>
     serviceRepairEffect({ deferred, json, reason: Option.getOrUndefined(reason) }),
@@ -478,11 +498,11 @@ const repairCommand = Command.make(
 const runCommand = Command.make(
   "run",
   {
-    force: Flag.boolean("force").pipe(
+    force: booleanFlag("force").pipe(
       Flag.withDescription("Deprecated; service runs sync every time"),
     ),
-    json: Flag.boolean("json").pipe(Flag.withDescription("Output machine-readable JSON")),
-    scheduled: Flag.boolean("scheduled").pipe(Flag.withHidden),
+    json: booleanFlag("json").pipe(Flag.withDescription("Output machine-readable JSON")),
+    scheduled: booleanFlag("scheduled").pipe(Flag.withHidden),
   },
   ({ force, json, scheduled }) => serviceRunEffect({ force, json, scheduled }),
 ).pipe(Command.withDescription("Run the automatic sync job now"));
@@ -900,6 +920,7 @@ function serviceStatusEffect(options: { json?: boolean | undefined } = {}) {
         lastRepairError: state?.lastRepairError ?? null,
         lastRepairReason: state?.lastRepairReason ?? null,
         lastRepairStatus: state?.lastRepairStatus ?? null,
+        lastReconcileAt: state?.lastReconcileAt ?? null,
         lastRows: state?.lastRows ?? null,
         lastSchedulerActive: state?.lastSchedulerActive ?? null,
         lastSince: state?.lastSince ?? null,
@@ -952,6 +973,7 @@ function serviceStatusEffect(options: { json?: boolean | undefined } = {}) {
         if (status.lastSince !== null) {
           console.log(`Last since: ${status.lastSince}`);
         }
+        console.log(`Last reconcile: ${status.lastReconcileAt ?? "never"}`);
         if (status.lastUpserted !== null) {
           console.log(`Last upserted: ${status.lastUpserted}`);
         }
@@ -1191,9 +1213,14 @@ function runServiceSyncOnce(paths: ServicePaths, options: ServiceRunOptions) {
       currentState,
       options.scheduled,
     );
+    const reconcile =
+      !usageReplacementBackfill && serviceReconcileDue(currentState, startedAt, options.scheduled);
+    const incrementalSince = serviceScheduledSyncSince(currentState, startedAt, options.scheduled);
     const scheduledSince = usageReplacementBackfill
       ? undefined
-      : serviceScheduledSyncSince(currentState, startedAt, options.scheduled);
+      : reconcile
+        ? earliestDateKey(incrementalSince, serviceReconcileSince(startedAt))
+        : incrementalSince;
     const metadata = yield* readServiceMetadata(paths.metadataPath);
     const nativeStatus = yield* readNativeSchedulerStatus(paths);
     const reloadRequired = serviceReloadRequired(metadata, currentState);
@@ -1329,6 +1356,7 @@ function runServiceSyncOnce(paths: ServicePaths, options: ServiceRunOptions) {
       durationMs: Date.now() - startedAtMs,
       reloadRequired,
       result: result.value,
+      reconciledAt: reconcile ? startedAtIso : undefined,
       schedulerActive: nativeStatus.active,
       since: scheduledSince,
       successAt,
@@ -1495,7 +1523,7 @@ function serviceRepairReason(input: {
   reloadRequired?: boolean | undefined;
   schedulerActive?: boolean | undefined;
   serviceFailed?: boolean | undefined;
-}): ServiceRepairReasonValue | undefined {
+}): ServiceRepairReason | undefined {
   if (input.serviceFailed === true) {
     return "service-failure";
   }
@@ -1513,7 +1541,7 @@ function serviceRepairReason(input: {
 }
 
 function serviceRepairNeedsSchedulerInstall(input: {
-  reason: ServiceRepairReasonValue;
+  reason: ServiceRepairReason;
   reloadRequired?: boolean | undefined;
   schedulerActive: boolean;
 }): boolean {
@@ -1527,7 +1555,7 @@ function serviceRepairCanInstallScheduler(input: {
   return !(input.backend === "launchd" && input.deferred === true);
 }
 
-function parseServiceRepairReason(value: string | undefined): ServiceRepairReasonValue | undefined {
+function parseServiceRepairReason(value: string | undefined): ServiceRepairReason | undefined {
   if (
     value === "auto-updated" ||
     value === "reload-required" ||
@@ -1596,7 +1624,7 @@ function serviceRepairCommand(): string {
 
 function scheduleDeferredServiceRepair(
   commandPath: string,
-  reason: ServiceRepairReasonValue,
+  reason: ServiceRepairReason,
 ): Effect.Effect<ServiceRepairReport, never> {
   const attemptedAt = new Date().toISOString();
 
@@ -1627,7 +1655,7 @@ function scheduleDeferredServiceRepair(
 
 function spawnDeferredServiceRepair(
   commandPath: string,
-  reason: ServiceRepairReasonValue,
+  reason: ServiceRepairReason,
   platform = process.platform,
 ) {
   const invocation = deferredServiceRepairInvocation(commandPath, reason, platform, process.env);
@@ -1637,7 +1665,7 @@ function spawnDeferredServiceRepair(
 
 function deferredServiceRepairInvocation(
   commandPath: string,
-  reason: ServiceRepairReasonValue,
+  reason: ServiceRepairReason,
   platform: NodeJS.Platform,
   env: Record<string, string | undefined> = process.env,
 ): {
@@ -1700,7 +1728,7 @@ function deferredServiceRepairInvocation(
   };
 }
 
-function systemdRepairUnitName(reason: ServiceRepairReasonValue): string {
+function systemdRepairUnitName(reason: ServiceRepairReason): string {
   return `${SYSTEMD_NAME}-repair-${reason}`;
 }
 
@@ -1710,7 +1738,7 @@ function systemdRunEnvArgs(env: Record<string, string>): string[] {
 
 function maybeScheduleDeferredServiceRepair(input: {
   commandPath: string | undefined;
-  reason: ServiceRepairReasonValue | undefined;
+  reason: ServiceRepairReason | undefined;
   scheduled: boolean;
 }): Effect.Effect<ServiceRepairReport | undefined, never> {
   if (!input.scheduled || input.commandPath === undefined || input.reason === undefined) {
@@ -1835,6 +1863,7 @@ function serviceRunSuccessState(
     attemptAt: string;
     autoUpdate: ServiceAutoUpdateReport;
     durationMs: number;
+    reconciledAt?: string | undefined;
     reloadRequired?: boolean | undefined;
     result: SyncResult;
     schedulerActive?: boolean | undefined;
@@ -1857,6 +1886,10 @@ function serviceRunSuccessState(
     lastSchedulerActive: input.schedulerActive,
     lastSince: input.since,
     lastSources: serviceSourcesForState(input.result),
+    lastReconcileAt:
+      input.result.status === "error" || input.reconciledAt === undefined
+        ? currentState.lastReconcileAt
+        : input.reconciledAt,
     lastSuccessAt: input.result.status === "error" ? currentState.lastSuccessAt : input.successAt,
     lastSyncStatus: input.result.status,
     lastUpserted: input.result.upserted ?? 0,
@@ -2008,6 +2041,42 @@ function serviceScheduledSyncSince(
   }
 
   return previousLocalDateKey(now);
+}
+
+function serviceReconcileDue(state: ServiceState, now: Date, scheduled: boolean): boolean {
+  if (!scheduled) {
+    return false;
+  }
+
+  const lastReconcileAt =
+    state.lastReconcileAt === undefined ? Number.NaN : Date.parse(state.lastReconcileAt);
+  if (Number.isNaN(lastReconcileAt) || lastReconcileAt > now.getTime()) {
+    return true;
+  }
+
+  return now.getTime() - lastReconcileAt >= SERVICE_RECONCILE_INTERVAL_MS;
+}
+
+function serviceReconcileSince(
+  now: Date,
+  env: Record<string, string | undefined> = process.env,
+): string {
+  const days = serviceReconcileWindowDays(env);
+
+  return localDateKey(new Date(now.getFullYear(), now.getMonth(), now.getDate() - (days - 1)));
+}
+
+function serviceReconcileWindowDays(env: Record<string, string | undefined> = process.env): number {
+  const raw = env[SERVICE_RECONCILE_WINDOW_ENV]?.trim();
+  const days = raw === undefined || !/^\d+$/.test(raw) ? Number.NaN : Number(raw);
+
+  return Number.isInteger(days) && days >= 1 && days <= SERVICE_RECONCILE_WINDOW_MAX_DAYS
+    ? days
+    : SERVICE_RECONCILE_WINDOW_DAYS;
+}
+
+function earliestDateKey(first: string | undefined, second: string): string {
+  return first !== undefined && first < second ? first : second;
 }
 
 function serviceNeedsUsageReplacementBackfill(state: ServiceState, scheduled: boolean): boolean {
@@ -2270,6 +2339,7 @@ function serviceStateJson(state: ServiceState): Partial<ServiceState> {
     ...(state.lastRepairReason === undefined ? {} : { lastRepairReason: state.lastRepairReason }),
     ...(state.lastRepairStatus === undefined ? {} : { lastRepairStatus: state.lastRepairStatus }),
     ...(state.lastRows === undefined ? {} : { lastRows: state.lastRows }),
+    ...(state.lastReconcileAt === undefined ? {} : { lastReconcileAt: state.lastReconcileAt }),
     ...(state.lastSchedulerActive === undefined
       ? {}
       : { lastSchedulerActive: state.lastSchedulerActive }),
@@ -3400,24 +3470,25 @@ function servicePaths({
     return null;
   }
 
-  const configDir = dirname(getConfigPath(env));
-  const wrapperPath = join(
+  const path = platform === "win32" ? win32Path : posixPath;
+  const configDir = env["TOKENMAXXING_CONFIG_DIR"] ?? path.dirname(getConfigPath(env));
+  const wrapperPath = path.join(
     configDir,
     platform === "win32" ? WINDOWS_WRAPPER_NAME : POSIX_WRAPPER_NAME,
   );
-  const logPath = join(configDir, "service.log");
-  const lockPath = join(configDir, "service.lock");
-  const metadataPath = join(configDir, "service.json");
-  const runnerPointerPath = join(configDir, SERVICE_RUNNER_POINTER_NAME);
-  const runnersDir = join(configDir, SERVICE_RUNNER_DIR_NAME);
-  const statePath = join(configDir, "service-state.json");
-  const updateLockPath = join(configDir, "service-update.lock");
+  const logPath = path.join(configDir, "service.log");
+  const lockPath = path.join(configDir, "service.lock");
+  const metadataPath = path.join(configDir, "service.json");
+  const runnerPointerPath = path.join(configDir, SERVICE_RUNNER_POINTER_NAME);
+  const runnersDir = path.join(configDir, SERVICE_RUNNER_DIR_NAME);
+  const statePath = path.join(configDir, "service-state.json");
+  const updateLockPath = path.join(configDir, "service-update.lock");
 
   if (backend === "launchd") {
     return {
       backend,
       configDir,
-      definitionPath: join(home, "Library", "LaunchAgents", `${SERVICE_LABEL}.plist`),
+      definitionPath: path.join(home, "Library", "LaunchAgents", `${SERVICE_LABEL}.plist`),
       lockPath,
       logPath,
       metadataPath,
@@ -3430,11 +3501,15 @@ function servicePaths({
   }
 
   if (backend === "systemd") {
-    const systemdDir = join(env["XDG_CONFIG_HOME"] ?? join(home, ".config"), "systemd", "user");
+    const systemdDir = path.join(
+      env["XDG_CONFIG_HOME"] ?? path.join(home, ".config"),
+      "systemd",
+      "user",
+    );
     return {
       backend,
       configDir,
-      definitionPath: join(systemdDir, `${SYSTEMD_NAME}.service`),
+      definitionPath: path.join(systemdDir, `${SYSTEMD_NAME}.service`),
       lockPath,
       logPath,
       metadataPath,
@@ -4029,7 +4104,7 @@ function legacyServiceWrapperPaths(paths: ServicePaths): string[] {
     return [];
   }
 
-  const legacyWrapperPath = join(paths.configDir, LEGACY_POSIX_WRAPPER_NAME);
+  const legacyWrapperPath = posixPath.join(paths.configDir, LEGACY_POSIX_WRAPPER_NAME);
 
   return legacyWrapperPath === paths.wrapperPath ? [] : [legacyWrapperPath];
 }
@@ -4209,6 +4284,7 @@ function capturedServiceEnv(
     "TOKENMAXXING_ENV",
     "TOKENMAXXING_API_URL",
     "TOKENMAXXING_WWW_URL",
+    SERVICE_RECONCILE_WINDOW_ENV,
   ]) {
     const value = env[key];
     if (value !== undefined && value !== "") {
@@ -4508,6 +4584,9 @@ export {
   serviceRunnerTargetCandidates,
   serviceCompletedUsageReplacementBackfill,
   serviceNeedsUsageReplacementBackfill,
+  serviceReconcileDue,
+  serviceReconcileSince,
+  serviceReconcileWindowDays,
   serviceScheduledSyncSince,
   serviceCommand,
   serviceInstallProgram,
@@ -4518,6 +4597,7 @@ export {
   servicePaths,
   serviceRunFailureState,
   serviceRunLogLine,
+  writeServiceCheckIn,
   serviceRunSuccessState,
   runPackageManagerUpdate,
   verifyNpmIntegrity,
@@ -4539,6 +4619,7 @@ export type {
   AutoUpdateManager,
   CommandInstall,
   ServiceBackend,
+  ServiceCheckIn,
   ServiceInstallOptions,
   ServiceMetadata,
   ServiceAutoUpdateReport,

@@ -4,11 +4,10 @@ import { Gear, SignOut, Star, User } from "@phosphor-icons/react/ssr";
 
 import { signOut } from "../lib/api";
 import { meQueryOptions } from "../lib/queries";
+import { GITHUB_URL } from "../lib/site";
 import { Avatar } from "./ui/avatar";
 import { buttonClassName } from "./ui/button";
 import { Menu } from "./ui/menu";
-
-const GITHUB_URL = "https://github.com/851-labs/tokenmaxxing";
 
 function Nav() {
   return (
@@ -21,7 +20,9 @@ function Nav() {
           className="hidden items-baseline gap-6 justify-self-center sm:flex"
           aria-label="Primary"
         >
+          {/* In-page anchors: only the one whose hash is in the URL is current. */}
           <Link
+            activeOptions={{ includeHash: true }}
             activeProps={{ className: "text-foreground" }}
             className="text-sm text-muted-foreground transition-colors hover:text-foreground"
             hash="leaderboard"
@@ -30,6 +31,8 @@ function Nav() {
             Leaderboard
           </Link>
           <Link
+            activeOptions={{ includeHash: true }}
+            activeProps={{ className: "text-foreground" }}
             className="text-sm text-muted-foreground transition-colors hover:text-foreground"
             hash="faq"
             to="/"
@@ -37,7 +40,7 @@ function Nav() {
             FAQ
           </Link>
         </nav>
-        <div className="justify-self-end">
+        <div className="col-start-3 justify-self-end">
           <UserMenu />
         </div>
       </div>
@@ -66,7 +69,8 @@ function UserMenu() {
     );
   }
 
-  if (me.isError) {
+  const user = me.data?.user;
+  if (user === undefined) {
     return (
       <div className="flex items-center gap-2">
         <GithubStarLink />
@@ -76,8 +80,6 @@ function UserMenu() {
       </div>
     );
   }
-
-  const user = me.data.user;
 
   return (
     <div className="flex items-center gap-2">
@@ -95,7 +97,7 @@ function UserMenu() {
           </Menu.Item>
           <Menu.Separator />
           <Menu.Item
-            className="text-red-500 data-[highlighted]:bg-red-500/10 data-[highlighted]:text-red-500"
+            className="text-red-500 data-highlighted:bg-red-500/10 data-highlighted:text-red-500"
             icon={<SignOut />}
             onClick={() => signout.mutate()}
           >

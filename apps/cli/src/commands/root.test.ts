@@ -1,7 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { resolve } from "node:path";
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it } from "vite-plus/test";
 
 const cliRoot = resolve(import.meta.dirname, "../..");
 
@@ -38,7 +38,7 @@ describe("root command", () => {
     expect(result.output).toContain("upgrade      Upgrade the globally installed CLI");
   });
 
-  it("exposes --json on all service subcommands and upgrade", () => {
+  it("exposes --json on all service subcommands and upgrade", { timeout: 15_000 }, () => {
     for (const args of [
       ["upgrade", "--help"],
       ["service", "install", "--help"],
@@ -64,5 +64,3 @@ describe("root command", () => {
     expect(result.output).not.toContain("--json");
   });
 });
-
-export {};

@@ -121,6 +121,33 @@ to you in settings and your per-device breakdown. CLI tokens do not expire
 automatically; revoke one with `tokenmaxxing logout` or from
 [settings](https://tokenmaxxing.sh/settings).
 
+## Development
+
+Use Bun 1.4.2 and Node.js 24.18.0 (the CI runtime). Vite+ is installed locally;
+no global CLI installation is required.
+
+```bash
+bun install --frozen-lockfile
+bun run dev          # Start the Alchemy development environment
+bun run check        # Check formatting, lint rules, and types
+bun run test         # Run all test projects
+bun run build        # Build workspaces in dependency order
+bun run fmt:fix      # Format files
+```
+
+Shared formatting, linting, and test settings live in the root
+`vite.config.ts`; the web app keeps its framework plugins in `apps/www/vite.config.ts`.
+`bun run check` includes TypeScript diagnostics through `lint.options.typeCheck`.
+Builds use Vite Task caching. Checks, tests, and database generation are uncached.
+Run tests from the repository root. To run one project, use
+`bun run vp test --project cli` (or `api`, `www`, `api-contract`, or `db`).
+Use `bun run vp test watch --project cli` for watch mode.
+
+Vite+ pins its bundled tools. Keep the `vite` catalog alias and override aligned
+with the `vite-plus` version so framework plugins and Alchemy use the same Vite core.
+The root Vitest 5 dependency satisfies Alchemy's `@effect/vitest` peer; our tests
+import `vite-plus/test` and run on Vite+'s bundled Vitest version.
+
 ## Support
 
 Join the [Discord](https://discord.gg/WzX6BpfaRH), follow

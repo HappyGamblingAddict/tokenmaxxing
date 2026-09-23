@@ -2,7 +2,7 @@ import { arch, hostname } from "node:os";
 
 import { Data, Effect } from "effect";
 import { Command, Flag } from "effect/unstable/cli";
-import type { AuthUser } from "@tokenmaxxing/api-contract";
+import { DeviceId, type AuthUser } from "@tokenmaxxing/api-contract";
 
 import packageJson from "../../package.json";
 import {
@@ -13,9 +13,11 @@ import {
   ConfigService,
   TerminalService,
 } from "../services";
+import { booleanFlag } from "../flags";
 import { formatUrl, humanFrame, humanLog, humanSpinner, writeJson } from "../output";
 import {
   alreadyLoggedInAsMessage,
+  apiErrorMessage,
   loggedInAsMessage,
   validateCurrentLogin,
 } from "../auth-validation";
@@ -23,13 +25,24 @@ import {
 class StartCliLoginError extends Data.TaggedError("StartCliLoginError")<{
   readonly cause: unknown;
 }> {
-  override message = "error: failed to start CLI login\nhint: check your network and try again";
+  override get message() {
+    const apiMessage = apiErrorMessage(this.cause);
+    return apiMessage === undefined
+      ? "error: failed to start CLI login\nhint: check your network and try again"
+      : `error: ${apiMessage}`;
+  }
 }
 
 class PollCliLoginError extends Data.TaggedError("PollCliLoginError")<{
   readonly cause: unknown;
 }> {
-  override message = "error: failed to poll CLI login\nhint: run tokenmaxxing login again";
+  override get message() {
+    // e.g. an expired or unknown login code: the server says what to do next.
+    const apiMessage = apiErrorMessage(this.cause);
+    return apiMessage === undefined
+      ? "error: failed to poll CLI login\nhint: run tokenmaxxing login again"
+      : `error: ${apiMessage}`;
+  }
 }
 
 class OpenBrowserError extends Data.TaggedError("OpenBrowserError")<{
@@ -111,7 +124,7 @@ interface BrowserLoginResult {
 const loginCommand = Command.make(
   "login",
   {
-    json: Flag.boolean("json").pipe(Flag.withDescription("Output machine-readable JSON")),
+    json: booleanFlag("json").pipe(Flag.withDescription("Output machine-readable JSON")),
   },
   ({ json }) => loginEffect({ json }),
 ).pipe(Command.withDescription("Log in to tokenmaxxing via your browser"));
@@ -191,16 +204,24 @@ function browserLoginEffect(options: BrowserLoginOptions) {
       .start({
         payload: {
           deviceArch: arch(),
-          deviceId,
+          deviceId: DeviceId.make(deviceId),
           deviceName: hostname(),
           devicePlatform: process.platform,
           deviceVersion: packageJson.version,
+          flow: "device_code",
         },
       })
       .pipe(
-        Effect.tap((login) => Effect.sync(() => startSpinner.stop(`Code: ${login.code}`))),
-        Effect.tapError(() => Effect.sync(() => startSpinner.error("Failed to start CLI login"))),
         Effect.mapError((cause) => new StartCliLoginError({ cause })),
+        // The deviceCode is the only credential poll accepts; never proceed
+        // (or fall back to polling by the user code) without it.
+        Effect.flatMap(({ deviceCode, ...login }) =>
+          deviceCode === undefined
+            ? Effect.fail(new StartCliLoginError({ cause: "missing deviceCode" }))
+            : Effect.succeed({ ...login, deviceCode }),
+        ),
+        Effect.tap((login) => Effect.sync(() => startSpinner.stop(`Code: ${login.userCode}`))),
+        Effect.tapError(() => Effect.sync(() => startSpinner.error("Failed to start CLI login"))),
       );
 
     if (canOpenBrowser) {
@@ -239,7 +260,7 @@ function browserLoginEffect(options: BrowserLoginOptions) {
 
     for (let attempt = 0; attempt < MAX_POLL_ATTEMPTS; attempt += 1) {
       const poll = yield* client.cliLogin
-        .poll({ payload: { code: start.code } })
+        .poll({ payload: { deviceCode: start.deviceCode } })
         .pipe(Effect.mapError((cause) => new PollCliLoginError({ cause })));
 
       if (poll.status === "complete") {

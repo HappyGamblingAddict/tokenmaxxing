@@ -5,8 +5,8 @@ import { delimiter, dirname, join } from "node:path";
 import { gzipSync } from "node:zlib";
 
 import { Cause, Effect, Layer } from "effect";
-import type { AuthUser } from "@tokenmaxxing/api-contract";
-import { describe, expect, it } from "vitest";
+import { Unauthorized, UserId, type AuthUser } from "@tokenmaxxing/api-contract";
+import { describe, expect, it } from "vite-plus/test";
 
 import packageJson from "../../package.json";
 import {
@@ -55,6 +55,9 @@ import {
   serviceRunnerTarget,
   serviceCompletedUsageReplacementBackfill,
   serviceNeedsUsageReplacementBackfill,
+  serviceReconcileDue,
+  serviceReconcileSince,
+  serviceReconcileWindowDays,
   serviceScheduledSyncSince,
   serviceInstallProgram,
   serviceLockStatus,
@@ -93,7 +96,7 @@ interface TestState {
 
 const user: AuthUser = {
   avatarUrl: null,
-  id: "user_123",
+  id: UserId.make("user_123"),
   login: "alex",
   name: null,
 };
@@ -152,7 +155,9 @@ function makeTestLayer(options: TestLayerOptions) {
             start: () =>
               Effect.succeed({
                 code: "ABC123",
+                deviceCode: "device-secret",
                 expiresAt: "2026-06-13T20:00:00.000Z",
+                userCode: "ABC123",
                 intervalSeconds: 0,
                 verificationUri: "https://tokenmaxxing.example/login/cli?code=ABC123",
               }),
@@ -296,7 +301,7 @@ function makeInstallRuntime(
 }
 
 function unauthorizedError() {
-  return Object.assign(new Error("unauthorized"), { _tag: "Unauthorized" as const });
+  return new Unauthorized({});
 }
 
 function failureTag(exit: Awaited<ReturnType<typeof Effect.runPromiseExit>>): string | undefined {
@@ -600,7 +605,7 @@ describe("native scheduler templates", () => {
       "/MO",
       "5",
       "/TR",
-      '"C:\\Users\\alex\\AppData\\Roaming\\tokenmaxxing/service-sync.cmd"',
+      '"C:\\Users\\alex\\AppData\\Roaming\\tokenmaxxing\\service-sync.cmd"',
       "/F",
     ]);
   });
@@ -1017,52 +1022,56 @@ describe("service auto-update reports", () => {
     });
   });
 
-  it("fetches registry runner updates from the current release channel", async () => {
-    const paths = servicePaths({
-      env: { TOKENMAXXING_CONFIG_DIR: "/tmp/tokenmaxxing" },
-      home: "/Users/alex",
-      platform: "darwin",
-    })!;
-    const cases = [
-      { currentVersion: "0.4.12", nextVersion: "0.4.13", specifier: "latest" },
-      { currentVersion: "0.4.18-alpha.1", nextVersion: "0.4.18-alpha.2", specifier: "alpha" },
-      { currentVersion: "0.4.18-beta.1", nextVersion: "0.4.18-beta.2", specifier: "beta" },
-      { currentVersion: "0.4.18-rc.0", nextVersion: "0.4.18-rc.1", specifier: "rc" },
-    ];
+  it(
+    "fetches registry runner updates from the current release channel",
+    { timeout: 15_000 },
+    async () => {
+      const paths = servicePaths({
+        env: { TOKENMAXXING_CONFIG_DIR: "/tmp/tokenmaxxing" },
+        home: "/Users/alex",
+        platform: "darwin",
+      })!;
+      const cases = [
+        { currentVersion: "0.4.12", nextVersion: "0.4.13", specifier: "latest" },
+        { currentVersion: "0.4.18-alpha.1", nextVersion: "0.4.18-alpha.2", specifier: "alpha" },
+        { currentVersion: "0.4.18-beta.1", nextVersion: "0.4.18-beta.2", specifier: "beta" },
+        { currentVersion: "0.4.18-rc.0", nextVersion: "0.4.18-rc.1", specifier: "rc" },
+      ];
 
-    for (const testCase of cases) {
-      const fetchedSpecifiers: string[] = [];
+      for (const testCase of cases) {
+        const fetchedSpecifiers: string[] = [];
 
-      await expect(
-        runAutoUpdate(
-          registryMetadata,
-          {
-            fetchRunnerRelease: (_target, versionSpecifier) => {
-              fetchedSpecifiers.push(versionSpecifier);
-              return Effect.succeed(registryRelease(testCase.nextVersion));
+        await expect(
+          runAutoUpdate(
+            registryMetadata,
+            {
+              fetchRunnerRelease: (_target, versionSpecifier) => {
+                fetchedSpecifiers.push(versionSpecifier);
+                return Effect.succeed(registryRelease(testCase.nextVersion));
+              },
+              installRunnerRelease: (release) =>
+                Effect.succeed({
+                  packageName: release.packageName,
+                  path: `/tmp/tokenmaxxing/service-runners/${release.version}/darwin-arm64/tokenmaxxing`,
+                  target: release.target,
+                  version: release.version,
+                }),
+              now,
             },
-            installRunnerRelease: (release) =>
-              Effect.succeed({
-                packageName: release.packageName,
-                path: `/tmp/tokenmaxxing/service-runners/${release.version}/darwin-arm64/tokenmaxxing`,
-                target: release.target,
-                version: release.version,
-              }),
-            now,
-          },
-          testCase.currentVersion,
-          paths,
-        ),
-      ).resolves.toMatchObject({
-        installedVersion: testCase.nextVersion,
-        latestVersion: testCase.nextVersion,
-        manager: "registry",
-        reason: null,
-        status: "success",
-      });
-      expect(fetchedSpecifiers).toEqual([testCase.specifier]);
-    }
-  });
+            testCase.currentVersion,
+            paths,
+          ),
+        ).resolves.toMatchObject({
+          installedVersion: testCase.nextVersion,
+          latestVersion: testCase.nextVersion,
+          manager: "registry",
+          reason: null,
+          status: "success",
+        });
+        expect(fetchedSpecifiers).toEqual([testCase.specifier]);
+      }
+    },
+  );
 
   it("does not install an older registry runner candidate", async () => {
     const paths = servicePaths({
@@ -1394,6 +1403,68 @@ describe("serviceScheduledSyncSince", () => {
   });
 });
 
+describe("scheduled reconciliation window", () => {
+  const localDateTime = (year: number, month: number, day: number, hour = 12, minute = 0): Date =>
+    new Date(year, month - 1, day, hour, minute);
+  const now = localDateTime(2026, 9, 22, 16, 45);
+
+  it("reconciles on the first scheduled run after upgrading", () => {
+    expect(
+      serviceReconcileDue(
+        { lastSuccessAt: localDateTime(2026, 9, 22, 16, 40).toISOString(), version: 1 },
+        now,
+        true,
+      ),
+    ).toBe(true);
+  });
+
+  it("reconciles again once the interval has elapsed", () => {
+    const reconciledAt = (hoursAgo: number) =>
+      new Date(now.getTime() - hoursAgo * 60 * 60 * 1000).toISOString();
+
+    expect(serviceReconcileDue({ lastReconcileAt: reconciledAt(1), version: 1 }, now, true)).toBe(
+      false,
+    );
+    expect(serviceReconcileDue({ lastReconcileAt: reconciledAt(5.9), version: 1 }, now, true)).toBe(
+      false,
+    );
+    expect(serviceReconcileDue({ lastReconcileAt: reconciledAt(6), version: 1 }, now, true)).toBe(
+      true,
+    );
+  });
+
+  it("treats unreadable or future markers as due", () => {
+    expect(serviceReconcileDue({ lastReconcileAt: "not-a-date", version: 1 }, now, true)).toBe(
+      true,
+    );
+    expect(
+      serviceReconcileDue(
+        { lastReconcileAt: localDateTime(2026, 9, 23).toISOString(), version: 1 },
+        now,
+        true,
+      ),
+    ).toBe(true);
+  });
+
+  it("never reconciles manual service runs, which already sync everything", () => {
+    expect(serviceReconcileDue({ version: 1 }, now, false)).toBe(false);
+  });
+
+  it("re-sends a trailing window of local days including today", () => {
+    expect(serviceReconcileSince(now, {})).toBe("2026-09-02");
+    expect(serviceReconcileSince(now, { TOKENMAXXING_SYNC_WINDOW_DAYS: "1" })).toBe("2026-09-22");
+    expect(serviceReconcileSince(now, { TOKENMAXXING_SYNC_WINDOW_DAYS: "14" })).toBe("2026-09-09");
+    expect(serviceReconcileSince(localDateTime(2026, 3, 10), {})).toBe("2026-02-18");
+  });
+
+  it("falls back to the default window for invalid overrides", () => {
+    for (const value of ["", "0", "-3", "7.5", "abc", "91"]) {
+      expect(serviceReconcileWindowDays({ TOKENMAXXING_SYNC_WINDOW_DAYS: value })).toBe(21);
+    }
+    expect(serviceReconcileWindowDays({ TOKENMAXXING_SYNC_WINDOW_DAYS: " 90 " })).toBe(90);
+  });
+});
+
 describe("usage replacement backfill", () => {
   it("runs once on a scheduled service after upgrading", () => {
     expect(serviceNeedsUsageReplacementBackfill({ version: 1 }, true)).toBe(true);
@@ -1518,6 +1589,51 @@ describe("service run state", () => {
       },
       { source: "gemini", status: "skipped" },
     ]);
+  });
+
+  it("records a completed reconciliation", () => {
+    const state = serviceRunSuccessState(
+      { lastReconcileAt: "2026-06-16T02:00:00.000Z", version: 1 },
+      {
+        arch: "arm64",
+        attemptAt: "2026-06-16T10:00:00.000Z",
+        autoUpdate: autoUpdateReport(),
+        durationMs: 1234,
+        reconciledAt: "2026-06-16T10:00:00.000Z",
+        result: syncResult,
+        since: "2026-05-27",
+        successAt: "2026-06-16T10:00:01.000Z",
+        version: "0.6.1",
+      },
+    );
+
+    expect(state.lastReconcileAt).toBe("2026-06-16T10:00:00.000Z");
+    expect(serviceStateJson(state)).toMatchObject({
+      lastReconcileAt: "2026-06-16T10:00:00.000Z",
+    });
+  });
+
+  it("keeps the previous reconciliation marker for incremental or failed runs", () => {
+    const base = {
+      arch: "arm64",
+      attemptAt: "2026-06-16T10:00:00.000Z",
+      autoUpdate: autoUpdateReport(),
+      durationMs: 1234,
+      successAt: "2026-06-16T10:00:01.000Z",
+      version: "0.6.1",
+    };
+    const current = { lastReconcileAt: "2026-06-16T02:00:00.000Z", version: 1 as const };
+
+    expect(serviceRunSuccessState(current, { ...base, result: syncResult }).lastReconcileAt).toBe(
+      "2026-06-16T02:00:00.000Z",
+    );
+    expect(
+      serviceRunSuccessState(current, {
+        ...base,
+        reconciledAt: "2026-06-16T10:00:00.000Z",
+        result: { ...syncResult, rows: 0, status: "error" },
+      }).lastReconcileAt,
+    ).toBe("2026-06-16T02:00:00.000Z");
   });
 
   it("records source collection failures without advancing the last success", () => {

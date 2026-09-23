@@ -2,14 +2,17 @@ import { arch, hostname } from "node:os";
 
 import { Data, Effect, Option } from "effect";
 import { Command, Flag } from "effect/unstable/cli";
-import type {
-  AuthUser,
-  RawUsageReportInput,
-  SourceUsageStatsInput,
-  UsageDayInput,
+import {
+  type AuthUser,
+  isDateKey,
+  type RawUsageReportInput,
+  type SourceUsageStatsInput,
+  type UsageDayInput,
+  type UsageSource,
 } from "@tokenmaxxing/api-contract";
 
 import packageJson from "../../package.json";
+import { booleanFlag } from "../flags";
 import { aggregateDays, summarize, type SourceSummary } from "../ccusage/aggregate";
 import {
   type CcusageReportKind,
@@ -64,6 +67,32 @@ class UnknownSourceError extends Data.TaggedError("UnknownSourceError")<{
   }
 }
 
+class InvalidSinceError extends Data.TaggedError("InvalidSinceError")<{
+  readonly value: string;
+}> {
+  override get message() {
+    return `error: invalid --since date: ${this.value}\nhint: use a calendar date in YYYY-MM-DD format, e.g. --since 2026-01-31`;
+  }
+}
+
+/**
+ * Every requested source failed and nothing was collected. Raised after the
+ * per-source results (and the --json payload) are written, so the exit code
+ * reflects the failure. A "partial" sync is not an error: whatever was
+ * collected was pushed, and the payload/table name the degraded sources.
+ */
+class SyncSourcesFailedError extends Data.TaggedError("SyncSourcesFailedError")<{
+  readonly sources: readonly UsageSource[];
+}> {
+  override get message() {
+    if (this.sources.length === 0) {
+      return "error: no usage synced; source collection failed\nhint: run tokenmaxxing sync again";
+    }
+
+    return `error: no usage synced; ccusage failed for ${this.sources.join(", ")}\nhint: check that ccusage runs for ${this.sources.length > 1 ? "these agents" : "this agent"}, then run tokenmaxxing sync again`;
+  }
+}
+
 const usd0 = new Intl.NumberFormat("en-US", {
   currency: "USD",
   maximumFractionDigits: 0,
@@ -86,15 +115,13 @@ const ANSI_STYLE_SEQUENCE = new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*m`, 
 const syncCommand = Command.make(
   "sync",
   {
-    dryRun: Flag.boolean("dry-run").pipe(
-      Flag.withDescription("Aggregate locally but push nothing"),
-    ),
-    json: Flag.boolean("json").pipe(Flag.withDescription("Output machine-readable JSON")),
-    since: Flag.string("since").pipe(
+    dryRun: booleanFlag("dry-run").pipe(Flag.withDescription("Aggregate locally but push nothing")),
+    json: booleanFlag("json").pipe(Flag.withDescription("Output machine-readable JSON")),
+    since: Flag.String("since").pipe(
       Flag.optional,
       Flag.withDescription("Only sync days on or after this date (YYYY-MM-DD)"),
     ),
-    sources: Flag.string("sources").pipe(
+    sources: Flag.String("sources").pipe(
       Flag.optional,
       Flag.withDescription(
         `Comma-separated agents to sync (default: ${DEFAULT_SOURCE_NAMES.join(",")})`,
@@ -152,10 +179,10 @@ interface SyncSourceIssue {
 }
 
 type SyncSourceResult =
-  | { source: string; status: "failed"; summary: null; issue: SyncSourceIssue }
-  | { source: string; status: "partial"; summary: SyncSourceSummary; issue: SyncSourceIssue }
-  | { source: string; status: "skipped"; summary: null; reason: "no_data" }
-  | { source: string; status: "synced"; summary: SyncSourceSummary };
+  | { source: UsageSource; status: "failed"; summary: null; issue: SyncSourceIssue }
+  | { source: UsageSource; status: "partial"; summary: SyncSourceSummary; issue: SyncSourceIssue }
+  | { source: UsageSource; status: "skipped"; summary: null; reason: "no_data" }
+  | { source: UsageSource; status: "synced"; summary: SyncSourceSummary };
 
 type SyncStatus = "error" | "ok" | "partial";
 
@@ -214,13 +241,28 @@ function syncEffect(options: SyncOptions) {
 
       if (options.json) {
         yield* writeJson(syncJsonPayload(result));
+      } else if (!shouldRenderInlineSync(options)) {
+        yield* Effect.sync(() => {
+          console.log("");
+          console.log(renderSyncTable(result.sourceResults));
+          console.log("");
+        });
+      }
+
+      // Every source failed: exit non-zero. The rendered failure doubles as
+      // the summary line, after the per-source rows / JSON payload.
+      if (result.status === "error") {
+        return yield* Effect.fail(
+          new SyncSourcesFailedError({ sources: failedSyncSources(result.sourceResults) }),
+        );
+      }
+
+      if (options.json) {
         return;
       }
 
       if (shouldRenderInlineSync(options)) {
-        if (result.status === "error") {
-          yield* humanLog("error", "No usage synced; source collection failed", options);
-        } else if (result.rows === 0) {
+        if (result.rows === 0) {
           yield* humanLog("info", "Nothing to sync", options);
         } else if (result.dryRun) {
           yield* humanLog("success", "Dry run complete; nothing pushed", options);
@@ -229,12 +271,7 @@ function syncEffect(options: SyncOptions) {
         }
       } else {
         yield* Effect.sync(() => {
-          console.log("");
-          console.log(renderSyncTable(result.sourceResults));
-          console.log("");
-          if (result.status === "error") {
-            console.error("No usage synced; source collection failed");
-          } else if (result.rows === 0) {
+          if (result.rows === 0) {
             console.log("Nothing to sync");
           } else if (result.dryRun) {
             console.log("Dry run complete; nothing pushed");
@@ -255,6 +292,10 @@ function syncProgram(options: SyncProgramOptions, runtime: SyncProgramRuntime = 
   return Effect.gen(function* () {
     const runDailyReport = runtime.runDailyReport ?? runCcusageDailyReport;
     const runSessionReport = runtime.runSessionReport ?? runCcusageSessionReport;
+    if (options.since !== undefined && !isDateKey(options.since)) {
+      return yield* Effect.fail(new InvalidSinceError({ value: options.since }));
+    }
+
     const requested = options.sources?.split(",") ?? DEFAULT_SOURCE_NAMES;
     const { invalid, sources } = resolveSources(requested);
     if (invalid.length > 0) {
@@ -481,6 +522,10 @@ function retryBackoffMs(policy: UploadRetryPolicy, attempt: number): number {
   const jitter = jitterRatio === 0 ? 1 : 1 - jitterRatio + random() * jitterRatio * 2;
 
   return Math.max(0, Math.round(base * jitter));
+}
+
+function failedSyncSources(results: readonly SyncSourceResult[]): UsageSource[] {
+  return results.flatMap((result) => (result.status === "failed" ? [result.source] : []));
 }
 
 function syncJsonPayload(result: SyncResult) {
@@ -787,6 +832,7 @@ function formatCount(value: number, noun: string): string {
 
 export {
   formatSyncUsd,
+  InvalidSinceError,
   openProfileIfAvailable,
   renderSyncSuccess,
   renderSyncSourceResult,
@@ -801,6 +847,7 @@ export {
   syncProgram,
   SyncAuthValidationError,
   SyncPushError,
+  SyncSourcesFailedError,
   UnknownSourceError,
   uploadUsageReports,
 };
