@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, delimiter, dirname, join } from "node:path";
+import { delimiter, dirname, join, win32 } from "node:path";
 import { promisify } from "node:util";
 import { gzipSync } from "node:zlib";
 
@@ -913,7 +913,8 @@ describe("Windows hidden launcher", () => {
     // The wrapper runs by relative name from the launcher's folder, so no profile path is embedded
     // or re-parsed by cmd.exe; /d skips AutoRun commands that could change directory.
     expect(lines).toContain('command = cmd & " /d /c .\\service-sync.cmd"');
-    expect(basename(windowsPaths("C:\\tokenmaxxing").wrapperPath)).toBe("service-sync.cmd");
+    // The wrapper path is a Windows path, so it needs Windows basename semantics on every host.
+    expect(win32.basename(windowsPaths("C:\\tokenmaxxing").wrapperPath)).toBe("service-sync.cmd");
     expect(lines).toContain(
       'shell.CurrentDirectory = Left(WScript.ScriptFullName, InStrRev(WScript.ScriptFullName, "\\"))',
     );
