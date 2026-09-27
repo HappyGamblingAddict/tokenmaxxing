@@ -4706,9 +4706,8 @@ function readWindowsLauncherStatus(path: string): Effect.Effect<WindowsLauncherS
     try: () => readFile(path, "utf8"),
     catch: (cause) => cause,
   }).pipe(
-    Effect.map(
-      (content): WindowsLauncherStatus =>
-        content === renderWindowsLauncher() ? "current" : "outdated",
+    Effect.map((content): WindowsLauncherStatus =>
+      content === renderWindowsLauncher() ? "current" : "outdated",
     ),
     Effect.catch(() => Effect.succeed<WindowsLauncherStatus>("missing")),
   );
