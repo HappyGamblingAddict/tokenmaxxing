@@ -5,18 +5,20 @@ import { Data, Effect } from "effect";
 import type { CcusageDailyReport, CcusageSessionReport } from "./schema";
 import { decodeDailyReport, decodeSessionReport } from "./schema";
 import type { CcusageSource } from "./sources";
+import { type CcusageEnv, ccusageSourceEnv } from "./source-env";
 
 /**
- * Shells out to ccusage through npm on Windows because Bun can intermittently
- * omit ccusage's Windows optional native dependency. Windows uses cmd.exe so
- * this also works when the CLI is running under Node rather than Bun. Bun
- * remains the fallback for Windows installations without npm and the primary
- * runner elsewhere.
- * Runner and report failures stay typed so the sync layer can distinguish them
- * from valid empty reports.
+ * Shells out to `bun x ccusage@^20.0.22 <source> daily --json --breakdown`, with
+ * npx as the fallback when bun itself is missing. Windows prefers npx.cmd
+ * because Bun can intermittently omit ccusage's Windows optional native
+ * dependency; it runs through cmd.exe so this also works when the CLI is
+ * running under Node rather than Bun. Runner and report failures stay typed so
+ * the sync layer can distinguish them from valid empty reports.
  */
 
-const CCUSAGE_SPEC = "ccusage@^20.0.19";
+// 20.0.21 added the Antigravity and ZCode adapters; 20.0.22 stopped dropping
+// claude-fable-5-1 usage. Earlier v20 releases also carry the Codex replay fix.
+const CCUSAGE_SPEC = "ccusage@^20.0.22";
 const RUN_TIMEOUT_MS = 180_000;
 
 class CcusageRunError extends Data.TaggedError("CcusageRunError")<{
@@ -38,6 +40,8 @@ interface CcusageCommandInvocation {
 }
 
 interface ExecCcusageOptions {
+  /** Base environment for the child; defaults to `process.env`. */
+  env?: CcusageEnv | undefined;
   platform?: NodeJS.Platform | undefined;
   run?: CcusageCommandRunner | undefined;
   timeoutMs?: number | undefined;
@@ -54,6 +58,7 @@ type CcusageRunErrorCode =
 type CcusageCommandRunner = (
   command: string,
   args: string[],
+  env: CcusageEnv,
 ) => Effect.Effect<string, CcusageRunError>;
 
 function runCcusageDailyReport(
@@ -147,9 +152,10 @@ function execCcusage(
   options: ExecCcusageOptions = {},
 ): Effect.Effect<string, CcusageRunError> {
   const run = options.run ?? makeCcusageCommandRunner(source, report);
-  const [primary, fallback] = ccusageCommandInvocations(args, options.platform ?? process.platform);
-  const runInvocation = (invocation: CcusageCommandInvocation) =>
-    run(invocation.command, invocation.args).pipe(
+  const platform = options.platform ?? process.platform;
+  const [primary, fallback] = ccusageCommandInvocations(args, platform);
+  const runInvocation = (invocation: CcusageCommandInvocation, env: CcusageEnv) =>
+    run(invocation.command, invocation.args, env).pipe(
       Effect.timeout(`${Math.max(1, options.timeoutMs ?? RUN_TIMEOUT_MS)} millis`),
       Effect.mapError((error) =>
         error instanceof CcusageRunError
@@ -163,20 +169,24 @@ function execCcusage(
       ),
     );
 
-  return runInvocation(primary).pipe(
-    Effect.catch((error: CcusageRunError) =>
-      error.code === "command_not_found" ? runInvocation(fallback) : Effect.fail(error),
+  return Effect.promise(() => ccusageSourceEnv(source, options.env ?? process.env, platform)).pipe(
+    Effect.flatMap((env) =>
+      runInvocation(primary, env).pipe(
+        Effect.catch((error: CcusageRunError) =>
+          error.code === "command_not_found" ? runInvocation(fallback, env) : Effect.fail(error),
+        ),
+      ),
     ),
   );
 }
 
 function makeCcusageCommandRunner(source: string, report: CcusageReportKind): CcusageCommandRunner {
-  return (command, commandArgs) =>
+  return (command, commandArgs, env) =>
     Effect.callback<string, CcusageRunError>((resume) => {
       const child = execFile(
         command,
         commandArgs,
-        { maxBuffer: 256 * 1024 * 1024 },
+        { env, maxBuffer: 256 * 1024 * 1024 },
         (error, stdout) => {
           if (error) {
             resume(

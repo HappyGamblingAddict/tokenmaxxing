@@ -37,11 +37,22 @@ import type {
   ServiceRepairStatus,
 } from "@tokenmaxxing/api-contract";
 
+import {
+  type DistTags,
+  type DistTagVersion,
+  fetchDistTags,
+  followedDistTags,
+  LATEST_DIST_TAG,
+  parseSemVer,
+  resolveUpdate,
+} from "../cli-version";
 import { booleanFlag } from "../flags";
 import { ClockService, ConfigService, ConsoleService } from "../services";
 import { getConfigPath } from "../services/config";
 import { humanFrame, humanLog, humanSpinner, writeJson } from "../output";
 import packageJson from "../../package.json";
+import { prepareSourceCadence, SOURCE_CADENCE_FILE_NAME } from "../ccusage/cadence";
+import { DEFAULT_SOURCE_NAMES } from "../ccusage/sources";
 import {
   parseServiceRunnerTarget,
   platformForServiceRunnerTarget,
@@ -58,6 +69,7 @@ import {
   syncProgram,
   type SyncAuth,
   type SyncResult,
+  type SyncSkipReason,
   type SyncSourceIssue,
   type SyncStatus,
   type UploadRetryPolicy,
@@ -68,12 +80,15 @@ const gunzipPromise = promisify(gunzip);
 const require = createRequire(import.meta.url);
 
 const SERVICE_LABEL = "sh.tokenmaxxing.sync";
-const SERVICE_TEMPLATE_VERSION = 5;
+const SERVICE_TEMPLATE_VERSION = 6;
 const SYSTEMD_NAME = "tokenmaxxing-sync";
 const WINDOWS_TASK_NAME = "tokenmaxxing-sync";
 const POSIX_WRAPPER_NAME = "tokenmaxxing.sh";
 const LEGACY_POSIX_WRAPPER_NAME = "service-sync.sh";
 const WINDOWS_WRAPPER_NAME = "service-sync.cmd";
+const WINDOWS_LAUNCHER_NAME = "service-sync.vbs";
+const WINDOWS_TASK_XML_NAME = "service-task.xml";
+const WINDOWS_REPAIR_COMMAND_ENV = "TOKENMAXXING_SERVICE_REPAIR_COMMAND";
 const PACKAGE_NAME = "@851-labs/tokenmaxxing";
 const SERVICE_RUNNER_DIR_NAME = "service-runners";
 const SERVICE_RUNNER_POINTER_NAME = "service-runner-current";
@@ -84,6 +99,9 @@ const SERVICE_JITTER_MAX_MS = 60 * 1000;
 const SERVICE_API_TIMEOUT_MS = 60 * 1000;
 const SERVICE_FETCH_TIMEOUT_MS = 15 * 1000;
 const SERVICE_COMMAND_TIMEOUT_MS = 60 * 1000;
+const SERVICE_REPAIR_RUN_WAIT_MS = 15 * 60 * 1000;
+const SERVICE_REPAIR_RUN_POLL_MS = 500;
+const SERVICE_REPAIR_RUN_EXIT_GRACE_MS = 2 * 1000;
 const SERVICE_PACKAGE_UPDATE_TIMEOUT_MS = 4 * 60 * 1000;
 const SERVICE_VERSION_TIMEOUT_MS = 30 * 1000;
 const SERVICE_LOG_MAX_BYTES = 5 * 1024 * 1024;
@@ -100,7 +118,6 @@ const SERVICE_RECONCILE_WINDOW_DAYS = 21;
 const SERVICE_RECONCILE_WINDOW_MAX_DAYS = 90;
 const SERVICE_RECONCILE_WINDOW_ENV = "TOKENMAXXING_SYNC_WINDOW_DAYS";
 const SERVICE_RECONCILE_INTERVAL_MS = 6 * 60 * 60 * 1000;
-const NPM_LATEST_URL = "https://registry.npmjs.org/@851-labs%2Ftokenmaxxing/latest";
 const SERVICE_UPLOAD_RETRY_POLICY: UploadRetryPolicy = {
   attempts: 3,
   backoffMs: [1_000, 4_000, 16_000],
@@ -215,7 +232,7 @@ interface ServiceAutoUpdateReport {
 
 interface ServiceAutoUpdateRuntime {
   commandExists?: ((command: string) => Effect.Effect<boolean, never>) | undefined;
-  fetchLatestVersion?: (() => Effect.Effect<string | null, never>) | undefined;
+  fetchDistTags?: (() => Effect.Effect<DistTags | null, never>) | undefined;
   fetchRunnerRelease?:
     | ((
         target: ServiceRunnerTarget,
@@ -232,7 +249,7 @@ interface ServiceAutoUpdateRuntime {
   readInstalledVersion?: ((commandPath: string) => Effect.Effect<string | null, never>) | undefined;
   runnerTargetCandidates?: (() => readonly ServiceRunnerTarget[]) | undefined;
   runPackageManagerUpdate?:
-    | ((manager: AutoUpdateManager) => Effect.Effect<void, unknown>)
+    | ((manager: AutoUpdateManager, specifier: string) => Effect.Effect<void, unknown>)
     | undefined;
 }
 
@@ -270,10 +287,13 @@ interface ServiceState {
 }
 
 interface ServiceSourceState {
+  dailyMs?: number;
   days?: number;
   issue?: SyncSourceIssue;
   models?: number;
+  reason?: SyncSkipReason;
   rows?: number;
+  sessionMs?: number;
   sessions?: number | null;
   source: string;
   spendUsd?: number;
@@ -343,6 +363,8 @@ type DoctorAuthConfig =
     };
 
 type DoctorStatus = "info" | "ok" | "warn";
+
+type WindowsLauncherStatus = "current" | "missing" | "outdated";
 
 interface DoctorCheck {
   detail: string;
@@ -499,7 +521,7 @@ const runCommand = Command.make(
   "run",
   {
     force: booleanFlag("force").pipe(
-      Flag.withDescription("Deprecated; service runs sync every time"),
+      Flag.withDescription("Run every source, even ones whose logs are unchanged"),
     ),
     json: booleanFlag("json").pipe(Flag.withDescription("Output machine-readable JSON")),
     scheduled: booleanFlag("scheduled").pipe(Flag.withHidden),
@@ -736,6 +758,9 @@ function repairServiceProgram(options: ServiceRepairOptions = {}) {
           status: "scheduled",
         }),
       ).pipe(Effect.ignore);
+      if (paths.backend === "windows-task-scheduler") {
+        yield* waitForServiceRunExit(paths);
+      }
     }
 
     const repairResult = yield* Effect.gen(function* () {
@@ -906,6 +931,9 @@ function serviceStatusEffect(options: { json?: boolean | undefined } = {}) {
       const lockStatus = yield* readServiceLockStatus(paths.lockPath, now);
       const nativeStatus = yield* readNativeSchedulerStatus(paths);
       const reloadRequired = serviceReloadRequired(metadata, state);
+      const launcherPath = windowsLauncherPath(paths);
+      const launcherStatus =
+        launcherPath === null ? null : yield* readWindowsLauncherStatus(launcherPath);
       const status = {
         arch: state?.lastArch ?? null,
         autoUpdate: formatServiceStatusAutoUpdate(metadata),
@@ -930,6 +958,8 @@ function serviceStatusEffect(options: { json?: boolean | undefined } = {}) {
         lastSuccessDate: serviceLastSuccessDate(state) ?? null,
         lastUpserted: state?.lastUpserted ?? null,
         lastVersion: state?.lastCliVersion ?? null,
+        launcherPath,
+        launcherStatus,
         lock: formatServiceLockStatus(lockStatus),
         logPath: paths.logPath,
         reloadRequired,
@@ -1003,6 +1033,13 @@ function serviceStatusEffect(options: { json?: boolean | undefined } = {}) {
         }
         console.log(`Lock: ${status.lock}`);
         console.log(`Wrapper: ${status.wrapperPath}`);
+        if (status.launcherPath !== null) {
+          console.log(
+            `Launcher: ${status.launcherPath}${
+              status.launcherStatus === "current" ? "" : ` (${status.launcherStatus})`
+            }`,
+          );
+        }
         console.log(`Log: ${status.logPath}`);
       });
     }),
@@ -1069,6 +1106,14 @@ function serviceDoctorEffect(options: { json?: boolean | undefined } = {}) {
       const nativeStatus = yield* readNativeSchedulerStatus(paths);
       const reloadRequired = serviceReloadRequired(metadata, state);
       const wrapperExists = yield* fileExists(paths.wrapperPath);
+      const launcherPath = windowsLauncherPath(paths);
+      const launcherCheck =
+        launcherPath === null
+          ? null
+          : windowsLauncherDoctorCheck(
+              launcherPath,
+              yield* readWindowsLauncherStatus(launcherPath),
+            );
       const runnerPointerExists = yield* fileExists(paths.runnerPointerPath);
       const definitionExists =
         paths.definitionPath === null ? installed : yield* fileExists(paths.definitionPath);
@@ -1089,6 +1134,9 @@ function serviceDoctorEffect(options: { json?: boolean | undefined } = {}) {
             : yield* commandExists(autoUpdateManager);
       const lockStatus = yield* readServiceLockStatus(paths.lockPath, now);
       const logTail = yield* readLogTail(paths.logPath, 8);
+      const wrapperContents = yield* Effect.tryPromise(() =>
+        readFile(paths.wrapperPath, "utf8"),
+      ).pipe(Effect.catch(() => Effect.succeed(null)));
 
       const checks = [
         doctorCheck(
@@ -1114,6 +1162,8 @@ function serviceDoctorEffect(options: { json?: boolean | undefined } = {}) {
           paths.definitionPath ?? "tracked by Windows Task Scheduler metadata",
         ),
         doctorCheck(wrapperExists ? "ok" : "warn", "wrapper", paths.wrapperPath),
+        ...(launcherCheck === null ? [] : [launcherCheck]),
+        doctorServiceEnvCheck(wrapperContents),
         doctorCheck(
           runnerPointerExists ? "ok" : "warn",
           "runner",
@@ -1298,6 +1348,16 @@ function runServiceSyncOnce(paths: ServicePaths, options: ServiceRunOptions) {
       version: 1,
     }).pipe(Effect.mapError((cause) => new ServiceRunError({ cause })));
 
+    // Scheduled ticks skip sources whose logs are unchanged since their last
+    // upload and never re-run the session report (#69); anything else is a
+    // full run that also refreshes the uploaded session counts.
+    const cadence = yield* prepareSourceCadence({
+      cliVersion,
+      full: !options.scheduled || options.force || reconcile || usageReplacementBackfill,
+      path: serviceSourceCadencePath(paths),
+      since: scheduledSince,
+      sources: usageReplacementBackfill ? ["codex"] : DEFAULT_SOURCE_NAMES,
+    });
     const result = yield* syncProgram({
       auth,
       dryRun: false,
@@ -1305,12 +1365,16 @@ function runServiceSyncOnce(paths: ServicePaths, options: ServiceRunOptions) {
       silent: true,
       ...(scheduledSince === undefined ? {} : { since: scheduledSince }),
       ...(usageReplacementBackfill ? { sources: "codex" } : {}),
+      sourcePlans: cadence.plans,
       ...(options.scheduled ? { uploadPolicy: SERVICE_UPLOAD_RETRY_POLICY } : {}),
     }).pipe(
       Effect.match({
         onFailure: (cause) => ({ _tag: "failure" as const, cause }),
         onSuccess: (value) => ({ _tag: "success" as const, value }),
       }),
+      Effect.tap((outcome) =>
+        outcome._tag === "success" ? cadence.commit(outcome.value) : Effect.void,
+      ),
     );
 
     if (result._tag === "failure") {
@@ -1618,6 +1682,25 @@ function serviceRepairCheckInFromState(
   };
 }
 
+// cmd.exe re-opens a running batch file after every command and continues at its saved byte
+// offset, so rewriting service-sync.cmd while the scheduled sync that spawned this repair is still
+// inside it would resume that cmd.exe in the middle of the new file. Wait until the sync releases
+// the run lock, then give its wrapper a moment to exit, before touching any service files.
+function waitForServiceRunExit(paths: ServicePaths) {
+  return Effect.gen(function* () {
+    const clock = yield* Effect.service(ClockService);
+    const deadline = Date.now() + SERVICE_REPAIR_RUN_WAIT_MS;
+    while (Date.now() < deadline) {
+      const lockStatus = yield* readServiceLockStatus(paths.lockPath, new Date());
+      if (!lockStatus.locked || lockStatus.stale) {
+        break;
+      }
+      yield* clock.sleep(SERVICE_REPAIR_RUN_POLL_MS);
+    }
+    yield* clock.sleep(SERVICE_REPAIR_RUN_EXIT_GRACE_MS);
+  }).pipe(Effect.catch(() => Effect.void));
+}
+
 function serviceRepairCommand(): string {
   return "tokenmaxxing service repair";
 }
@@ -1628,7 +1711,11 @@ function scheduleDeferredServiceRepair(
 ): Effect.Effect<ServiceRepairReport, never> {
   const attemptedAt = new Date().toISOString();
 
-  return Effect.sync(() => {
+  return Effect.gen(function* () {
+    if (process.platform === "win32") {
+      // Installs from older templates have no launcher yet; the repair is what migrates them.
+      yield* writeWindowsLauncher(windowsLauncherPathForEnv(process.env));
+    }
     const child = spawnDeferredServiceRepair(commandPath, reason);
     child.on("error", () => {
       // The next scheduled run will surface repair-needed again if the helper
@@ -1673,18 +1760,20 @@ function deferredServiceRepairInvocation(
   command: string;
   options: Parameters<typeof spawn>[2];
 } {
+  // A detached child has no console, so a console program started from it opens a visible
+  // window. wscript.exe is a GUI program; the launcher's repair mode then runs the command with a
+  // hidden console that its children inherit. The command path travels through the environment so
+  // it is never re-encoded or re-quoted on the way.
   if (platform === "win32") {
     return {
-      args: [
-        "/d",
-        "/s",
-        "/c",
-        `timeout /t 2 /nobreak >nul & ${cmdQuote(
-          commandPath,
-        )} service repair --deferred --json --reason ${cmdQuote(reason)}`,
-      ],
-      command: "cmd",
-      options: { detached: true, stdio: "ignore", windowsHide: true },
+      args: ["//B", "//NoLogo", "//E:VBScript", windowsLauncherPathForEnv(env), "repair", reason],
+      command: windowsScriptHostPath(env),
+      options: {
+        detached: true,
+        env: { ...env, [WINDOWS_REPAIR_COMMAND_ENV]: commandPath },
+        stdio: "ignore",
+        windowsHide: true,
+      },
     };
   }
 
@@ -1930,8 +2019,14 @@ function serviceRunFailureState(
 
 function serviceSourcesForState(result: SyncResult): ServiceSourceState[] {
   return result.sourceResults.map((sourceResult) => {
+    const timings = result.timings?.[sourceResult.source];
+    const durations = {
+      ...(timings?.dailyMs === undefined ? {} : { dailyMs: timings.dailyMs }),
+      ...(timings?.sessionMs === undefined ? {} : { sessionMs: timings.sessionMs }),
+    };
     if (sourceResult.status === "failed") {
       return {
+        ...durations,
         issue: sourceResult.issue,
         source: sourceResult.source,
         status: sourceResult.status,
@@ -1940,6 +2035,8 @@ function serviceSourcesForState(result: SyncResult): ServiceSourceState[] {
 
     if (sourceResult.status === "skipped") {
       return {
+        ...durations,
+        ...(sourceResult.reason === "no_data" ? {} : { reason: sourceResult.reason }),
         source: sourceResult.source,
         status: sourceResult.status,
       };
@@ -1947,6 +2044,7 @@ function serviceSourcesForState(result: SyncResult): ServiceSourceState[] {
 
     const summary = sourceResult.summary;
     return {
+      ...durations,
       days: summary.days,
       ...(sourceResult.status === "partial" ? { issue: sourceResult.issue } : {}),
       models: summary.models,
@@ -2303,6 +2401,10 @@ function formatServiceLockSince(status: Extract<ServiceLockStatus, { locked: tru
   return parts.length === 0 ? "" : ` (${parts.join(", ")})`;
 }
 
+function serviceSourceCadencePath(paths: Pick<ServicePaths, "configDir">): string {
+  return join(paths.configDir, SOURCE_CADENCE_FILE_NAME);
+}
+
 function readServiceState(path: string): Effect.Effect<ServiceState | null, never> {
   return Effect.tryPromise({
     try: async () => JSON.parse(await readFile(path, "utf8")) as ServiceState,
@@ -2377,7 +2479,11 @@ function runServiceAutoUpdate(
     const attemptedAt = now().toISOString();
 
     if (metadata === null) {
-      const latestVersion = yield* (runtime.fetchLatestVersion ?? fetchLatestCliVersion)();
+      const distTags = yield* (runtime.fetchDistTags ?? fetchCliDistTags)();
+      const latestVersion =
+        distTags === null
+          ? null
+          : (resolveUpdate(options.currentVersion, distTags).newest?.version ?? null);
       return serviceAutoUpdateReport({
         attemptedAt,
         completedAt: now().toISOString(),
@@ -2410,26 +2516,30 @@ function runLegacyPackageManagerAutoUpdate(
 ): Effect.Effect<ServiceAutoUpdateReport, never, ConsoleService> {
   return Effect.gen(function* () {
     const console = yield* Effect.service(ConsoleService);
-    const fetchLatestVersion = runtime.fetchLatestVersion ?? fetchLatestCliVersion;
     const commandExists_ = runtime.commandExists ?? commandExists;
     const runUpdate = runtime.runPackageManagerUpdate ?? runPackageManagerUpdate;
     const readInstalledVersion = runtime.readInstalledVersion ?? readInstalledCliVersion;
-    const latestVersion = yield* fetchLatestVersion();
+    const distTags = yield* (runtime.fetchDistTags ?? fetchCliDistTags)();
+    const resolution = distTags === null ? null : resolveUpdate(options.currentVersion, distTags);
 
-    if (latestVersion === null) {
+    if (resolution === null || resolution.newest === null) {
       return serviceAutoUpdateReport({
         attemptedAt,
         completedAt: now().toISOString(),
         currentVersion: options.currentVersion,
         enabled: true,
-        latestVersion,
+        latestVersion: null,
         manager: metadata.autoUpdateManager ?? null,
         reason: "latest-unknown",
         status: "skipped",
       });
     }
 
-    if (normalizeVersion(options.currentVersion) === normalizeVersion(latestVersion)) {
+    // Only a strictly newer version on a followed dist-tag is installed; a
+    // prerelease runner ahead of `latest` must never be "updated" back to it.
+    const latestVersion = resolution.newest.version;
+    const target = resolution.update;
+    if (target === null) {
       return serviceAutoUpdateReport({
         attemptedAt,
         completedAt: now().toISOString(),
@@ -2493,7 +2603,7 @@ function runLegacyPackageManagerAutoUpdate(
       });
     }
 
-    const updateResult = yield* runUpdate(manager).pipe(
+    const updateResult = yield* runUpdate(manager, packageManagerSpecifier(target)).pipe(
       Effect.match({
         onFailure: (cause) => ({ _tag: "failure" as const, cause }),
         onSuccess: () => ({ _tag: "success" as const }),
@@ -2586,38 +2696,44 @@ function runServiceRunnerAutoUpdate(
     }
     const paths = options.paths;
 
-    const runnerChannel = serviceRunnerReleaseChannel(options.currentVersion);
     const fetchRunnerRelease = runtime.fetchRunnerRelease ?? fetchServiceRunnerRelease;
-    let release: ServiceRunnerRelease | null = null;
+    const releases = new Map<string, ServiceRunnerRelease>();
     for (const target of targets) {
-      const fetchResult = yield* fetchRunnerRelease(target, runnerChannel).pipe(
-        Effect.match({
-          onFailure: (cause) => ({ _tag: "failure" as const, cause }),
-          onSuccess: (value) => ({ _tag: "success" as const, value }),
-        }),
-      );
-      if (fetchResult._tag === "failure") {
-        return serviceAutoUpdateReport({
-          attemptedAt,
-          completedAt: now().toISOString(),
-          currentVersion: options.currentVersion,
-          enabled: true,
-          error: formatAutoUpdateError(fetchResult.cause.cause),
-          latestVersion: null,
-          manager: "registry",
-          reason: fetchResult.cause.reason,
-          status: "failure",
-        });
+      for (const distTag of followedDistTags(options.currentVersion)) {
+        const fetchResult = yield* fetchRunnerRelease(target, distTag).pipe(
+          Effect.match({
+            onFailure: (cause) => ({ _tag: "failure" as const, cause }),
+            onSuccess: (value) => ({ _tag: "success" as const, value }),
+          }),
+        );
+        if (fetchResult._tag === "failure") {
+          return serviceAutoUpdateReport({
+            attemptedAt,
+            completedAt: now().toISOString(),
+            currentVersion: options.currentVersion,
+            enabled: true,
+            error: formatAutoUpdateError(fetchResult.cause.cause),
+            latestVersion: null,
+            manager: "registry",
+            reason: fetchResult.cause.reason,
+            status: "failure",
+          });
+        }
+        if (fetchResult.value !== null) {
+          releases.set(distTag, fetchResult.value);
+        }
       }
 
-      const candidate = fetchResult.value;
-      if (candidate !== null) {
-        release = candidate;
+      if (releases.size > 0) {
         break;
       }
     }
 
-    if (release === null) {
+    const resolution = resolveUpdate(
+      options.currentVersion,
+      Object.fromEntries([...releases].map(([distTag, release]) => [distTag, release.version])),
+    );
+    if (resolution.newest === null) {
       return serviceAutoUpdateReport({
         attemptedAt,
         completedAt: now().toISOString(),
@@ -2630,19 +2746,20 @@ function runServiceRunnerAutoUpdate(
       });
     }
 
-    if (!serviceRunnerReleaseIsUpdateCandidate(options.currentVersion, release.version)) {
+    if (resolution.update === null) {
       return serviceAutoUpdateReport({
         attemptedAt,
         completedAt: now().toISOString(),
         currentVersion: options.currentVersion,
         enabled: true,
         installedVersion: options.currentVersion,
-        latestVersion: release.version,
+        latestVersion: resolution.newest.version,
         manager: "registry",
         reason: null,
         status: "not-needed",
       });
     }
+    const release = releases.get(resolution.update.distTag)!;
 
     const updateLock = yield* acquireServiceUpdateLock(paths.updateLockPath, now()).pipe(
       Effect.match({
@@ -2790,21 +2907,8 @@ function serviceAutoUpdateReport(input: ServiceAutoUpdateReport): ServiceAutoUpd
   };
 }
 
-function fetchLatestCliVersion(): Effect.Effect<string | null, never> {
-  return Effect.tryPromise({
-    try: async () => {
-      const response = await fetch(NPM_LATEST_URL, {
-        headers: { accept: "application/json" },
-        signal: AbortSignal.timeout(SERVICE_FETCH_TIMEOUT_MS),
-      });
-      if (!response.ok) {
-        return null;
-      }
-
-      return versionFromPackageJson(await response.json());
-    },
-    catch: (cause) => cause,
-  }).pipe(Effect.catch(() => Effect.succeed(null)));
+function fetchCliDistTags(): Effect.Effect<DistTags | null, never> {
+  return fetchDistTags(SERVICE_FETCH_TIMEOUT_MS).pipe(Effect.catch(() => Effect.succeed(null)));
 }
 
 function fetchServiceRunnerRelease(
@@ -2869,7 +2973,7 @@ function serviceRunnerReleaseFromPackageJson(
   const dist = (body as { dist?: unknown }).dist;
   if (
     typeof version !== "string" ||
-    parseServiceVersion(version) === null ||
+    parseSemVer(version) === null ||
     dist === null ||
     typeof dist !== "object"
   ) {
@@ -3122,15 +3226,6 @@ function readInstalledCliVersion(commandPath: string): Effect.Effect<string | nu
   }).pipe(Effect.catch(() => Effect.succeed(null)));
 }
 
-function versionFromPackageJson(body: unknown): string | null {
-  if (body === null || typeof body !== "object") {
-    return null;
-  }
-
-  const version = (body as { version?: unknown }).version;
-  return typeof version === "string" && version.length > 0 ? version : null;
-}
-
 function parseCliVersion(output: string): string | null {
   const match = /v?(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)/.exec(output);
   return match?.[1] ?? null;
@@ -3138,134 +3233,6 @@ function parseCliVersion(output: string): string | null {
 
 function normalizeVersion(version: string): string {
   return version.trim().replace(/^v/i, "").replace(/\+.*/, "");
-}
-
-interface ParsedServiceVersion {
-  major: number;
-  minor: number;
-  patch: number;
-  prerelease: readonly string[];
-}
-
-function serviceRunnerReleaseChannel(version: string): string {
-  const parsed = parseServiceVersion(version);
-  return parsed === null || parsed.prerelease.length === 0 ? "latest" : parsed.prerelease[0]!;
-}
-
-function serviceRunnerReleaseIsNewer(currentVersion: string, candidateVersion: string): boolean {
-  const comparison = compareServiceVersions(currentVersion, candidateVersion);
-  return comparison !== null && comparison < 0;
-}
-
-function serviceRunnerReleaseIsUpdateCandidate(
-  currentVersion: string,
-  candidateVersion: string,
-): boolean {
-  return (
-    serviceRunnerReleaseChannel(currentVersion) === serviceRunnerReleaseChannel(candidateVersion) &&
-    serviceRunnerReleaseIsNewer(currentVersion, candidateVersion)
-  );
-}
-
-function compareServiceVersions(left: string, right: string): number | null {
-  const leftVersion = parseServiceVersion(left);
-  const rightVersion = parseServiceVersion(right);
-  if (leftVersion === null || rightVersion === null) {
-    return null;
-  }
-
-  const coreDifference =
-    leftVersion.major - rightVersion.major ||
-    leftVersion.minor - rightVersion.minor ||
-    leftVersion.patch - rightVersion.patch;
-  if (coreDifference !== 0) {
-    return coreDifference;
-  }
-
-  return comparePrereleaseVersions(leftVersion.prerelease, rightVersion.prerelease);
-}
-
-function parseServiceVersion(version: string): ParsedServiceVersion | null {
-  const match = /^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+.+)?$/.exec(
-    version.trim(),
-  );
-  if (match === null) {
-    return null;
-  }
-
-  const major = Number(match[1]);
-  const minor = Number(match[2]);
-  const patch = Number(match[3]);
-  if (
-    !Number.isSafeInteger(major) ||
-    !Number.isSafeInteger(minor) ||
-    !Number.isSafeInteger(patch)
-  ) {
-    return null;
-  }
-
-  return {
-    major,
-    minor,
-    patch,
-    prerelease: match[4]?.split(".") ?? [],
-  };
-}
-
-function comparePrereleaseVersions(left: readonly string[], right: readonly string[]): number {
-  if (left.length === 0 && right.length === 0) {
-    return 0;
-  }
-  if (left.length === 0) {
-    return 1;
-  }
-  if (right.length === 0) {
-    return -1;
-  }
-
-  const length = Math.max(left.length, right.length);
-  for (let index = 0; index < length; index += 1) {
-    const leftPart = left[index];
-    const rightPart = right[index];
-    if (leftPart === undefined) {
-      return -1;
-    }
-    if (rightPart === undefined) {
-      return 1;
-    }
-
-    const difference = comparePrereleasePart(leftPart, rightPart);
-    if (difference !== 0) {
-      return difference;
-    }
-  }
-
-  return 0;
-}
-
-function comparePrereleasePart(left: string, right: string): number {
-  const leftNumber = numericPrereleasePart(left);
-  const rightNumber = numericPrereleasePart(right);
-  if (leftNumber !== null && rightNumber !== null) {
-    return leftNumber - rightNumber;
-  }
-  if (leftNumber !== null) {
-    return -1;
-  }
-  if (rightNumber !== null) {
-    return 1;
-  }
-
-  return left.localeCompare(right);
-}
-
-function numericPrereleasePart(part: string): number | null {
-  if (!/^(0|[1-9]\d*)$/.test(part)) {
-    return null;
-  }
-
-  const value = Number(part);
-  return Number.isSafeInteger(value) ? value : null;
 }
 
 function formatAutoUpdateError(cause: unknown): string {
@@ -3276,8 +3243,11 @@ function formatAutoUpdateError(cause: unknown): string {
   return String(cause);
 }
 
-function runPackageManagerUpdate(manager: AutoUpdateManager): Effect.Effect<void, unknown> {
-  const command = autoUpdateCommand(manager);
+function runPackageManagerUpdate(
+  manager: AutoUpdateManager,
+  specifier: string = LATEST_DIST_TAG,
+): Effect.Effect<void, unknown> {
+  const command = autoUpdateCommand(manager, specifier);
 
   return runExecutable(command.command, command.args, {
     timeoutMs: SERVICE_PACKAGE_UPDATE_TIMEOUT_MS,
@@ -3304,6 +3274,12 @@ function readLogTail(path: string, maxLines: number): Effect.Effect<string[], ne
 
 function doctorCheck(status: DoctorStatus, label: string, detail: string): DoctorCheck {
   return { detail, label, status };
+}
+
+function windowsLauncherDoctorCheck(path: string, status: WindowsLauncherStatus): DoctorCheck {
+  return status === "current"
+    ? doctorCheck("ok", "launcher", path)
+    : doctorCheck("warn", "launcher", `${path} ${status}; repair with ${serviceRepairCommand()}`);
 }
 
 function doctorLine(check: DoctorCheck): string {
@@ -3423,6 +3399,28 @@ function legacyWindowsTaskName(time: ScheduleTime): string {
 
 function windowsTaskNames(): string[] {
   return [windowsTaskName(), ...LEGACY_SCHEDULE_TIMES.map((time) => legacyWindowsTaskName(time))];
+}
+
+function windowsLauncherPath(paths: ServicePaths): string | null {
+  return paths.backend === "windows-task-scheduler"
+    ? join(paths.configDir, WINDOWS_LAUNCHER_NAME)
+    : null;
+}
+
+function windowsLauncherPathForEnv(env: Record<string, string | undefined>): string {
+  return join(dirname(getConfigPath(env)), WINDOWS_LAUNCHER_NAME);
+}
+
+function windowsTaskXmlPath(paths: ServicePaths): string {
+  return join(paths.configDir, WINDOWS_TASK_XML_NAME);
+}
+
+// Task Scheduler runs actions from its native (64-bit on x64/arm64) host, so %SystemRoot%\System32
+// is always the native wscript.exe there, even if this CLI runs under WOW64 file-system redirection.
+function windowsScriptHostPath(env: Record<string, string | undefined> = process.env): string {
+  const systemRoot = env["SystemRoot"] ?? env["SYSTEMROOT"] ?? "C:\\Windows";
+
+  return `${systemRoot.replace(/[\\/]+$/, "")}\\System32\\wscript.exe`;
 }
 
 function renderLaunchdStartInterval(): string {
@@ -3948,6 +3946,11 @@ function renderPosixLogRotation(logPath: string): string {
 rotate_tokenmaxxing_log ${quotedLogPath} || true`;
 }
 
+// The wrapper never embeds its own directory: cmd.exe decodes batch files in the console code
+// page, so the log and runner pointer are addressed through %~dp0 instead. chcp 65001 makes the
+// rest of the file (captured environment, runner pointer) decode as UTF-8. Paths are only ever
+// expanded inside quotes and outside parenthesized blocks, where & ( ) would otherwise break the
+// line.
 function renderWindowsWrapper({
   env,
   logPath,
@@ -3962,26 +3965,59 @@ function renderWindowsWrapper({
     .join("\r\n");
 
   return `@echo off\r
+"%SystemRoot%\\System32\\chcp.com" 65001 >nul\r
 setlocal\r
 ${sets}\r
-${renderWindowsLogRotation(logPath)}\r
->> ${cmdQuote(logPath)} echo [%DATE% %TIME%] tokenmaxxing service sync\r
-set /p TOKENMAXXING_SERVICE_RUNNER=<${cmdQuote(runnerPointerPath)}\r
-if "%TOKENMAXXING_SERVICE_RUNNER%"=="" (\r
-  >> ${cmdQuote(logPath)} echo tokenmaxxing service runner pointer is empty\r
-  exit /b 127\r
-)\r
-if not exist "%TOKENMAXXING_SERVICE_RUNNER%" (\r
-  >> ${cmdQuote(logPath)} echo tokenmaxxing service runner missing: %TOKENMAXXING_SERVICE_RUNNER%\r
-  exit /b 127\r
-)\r
-"%TOKENMAXXING_SERVICE_RUNNER%" ${serviceRunCommandArgs()} >> ${cmdQuote(logPath)} 2>&1\r
+set "TOKENMAXXING_LOG=%~dp0${win32Path.basename(logPath)}"\r
+${renderWindowsLogRotation()}\r
+>> "%TOKENMAXXING_LOG%" echo [%DATE% %TIME%] tokenmaxxing service sync\r
+set "TOKENMAXXING_SERVICE_RUNNER="\r
+set /p TOKENMAXXING_SERVICE_RUNNER=<"%~dp0${win32Path.basename(runnerPointerPath)}"\r
+if not defined TOKENMAXXING_SERVICE_RUNNER goto runner_pointer_empty\r
+if not exist "%TOKENMAXXING_SERVICE_RUNNER%" goto runner_missing\r
+"%TOKENMAXXING_SERVICE_RUNNER%" ${serviceRunCommandArgs()} >> "%TOKENMAXXING_LOG%" 2>&1\r
 exit /b %ERRORLEVEL%\r
+:runner_pointer_empty\r
+>> "%TOKENMAXXING_LOG%" echo tokenmaxxing service runner pointer is empty\r
+exit /b 127\r
+:runner_missing\r
+>> "%TOKENMAXXING_LOG%" echo tokenmaxxing service runner missing: "%TOKENMAXXING_SERVICE_RUNNER%"\r
+exit /b 127\r
 `;
 }
 
-function renderWindowsLogRotation(logPath: string): string {
-  const quotedLogPath = cmdQuote(logPath);
+// schtasks can only register interactive tasks, so a task that starts the .cmd wrapper directly
+// opens a console window on every run. The task starts this launcher with wscript.exe (a GUI
+// host) instead. It runs the wrapper with a hidden window (style 0), waits for it, and exits with
+// its code so Task Scheduler still records the sync result. cmd.exe keeps its hidden console, so
+// the runner and ccusage children inherit it rather than allocating visible ones.
+//
+// The script is pure ASCII (wscript reads .vbs files in the ANSI code page) and never embeds a
+// path: it runs the wrapper by relative name from its own folder, so no profile path passes
+// through cmd.exe's command-line parsing. "repair <reason>" runs the deferred repair command from
+// TOKENMAXXING_SERVICE_REPAIR_COMMAND the same way.
+function renderWindowsLauncher(): string {
+  return `' Generated by tokenmaxxing. Runs service commands without a console window.\r
+Option Explicit\r
+Dim shell, cmd, command, exitCode\r
+Set shell = CreateObject("WScript.Shell")\r
+cmd = """" & shell.ExpandEnvironmentStrings("%SystemRoot%") & "\\System32\\cmd.exe"""\r
+command = cmd & " /d /c .\\${WINDOWS_WRAPPER_NAME}"\r
+If WScript.Arguments.Count = 2 Then\r
+  If WScript.Arguments(0) = "repair" Then\r
+    command = cmd & " /d /s /c """"" & shell.Environment("PROCESS")("${WINDOWS_REPAIR_COMMAND_ENV}") & """ service repair --deferred --json --reason " & WScript.Arguments(1) & """"\r
+  End If\r
+End If\r
+On Error Resume Next\r
+shell.CurrentDirectory = Left(WScript.ScriptFullName, InStrRev(WScript.ScriptFullName, "\\"))\r
+If Err.Number = 0 Then exitCode = shell.Run(command, 0, True)\r
+If Err.Number <> 0 Then exitCode = 127\r
+On Error GoTo 0\r
+WScript.Quit exitCode\r
+`;
+}
+
+function renderWindowsLogRotation(): string {
   const moves = Array.from({ length: SERVICE_LOG_ROTATIONS - 1 }, (_, index) => {
     const rotation = SERVICE_LOG_ROTATIONS - index;
     const previousRotation = rotation - 1;
@@ -3989,8 +4025,7 @@ function renderWindowsLogRotation(logPath: string): string {
     return `  if exist "%TOKENMAXXING_LOG%.${previousRotation}" move /y "%TOKENMAXXING_LOG%.${previousRotation}" "%TOKENMAXXING_LOG%.${rotation}" >nul 2>nul`;
   }).join("\r\n");
 
-  return `set "TOKENMAXXING_LOG=${escapeCmdSetValue(logPath)}"\r
-if exist ${quotedLogPath} for %%A in (${quotedLogPath}) do if %%~zA GEQ ${SERVICE_LOG_MAX_BYTES} (\r
+  return `if exist "%TOKENMAXXING_LOG%" for %%A in ("%TOKENMAXXING_LOG%") do if %%~zA GEQ ${SERVICE_LOG_MAX_BYTES} (\r
   if exist "%TOKENMAXXING_LOG%.${SERVICE_LOG_ROTATIONS}" del /f /q "%TOKENMAXXING_LOG%.${SERVICE_LOG_ROTATIONS}" >nul 2>nul\r
 ${moves}\r
   move /y "%TOKENMAXXING_LOG%" "%TOKENMAXXING_LOG%.1" >nul 2>nul\r
@@ -4061,6 +4096,10 @@ function writeServiceFiles(
       if (paths.backend !== "windows-task-scheduler") {
         await chmod(paths.wrapperPath, 0o755);
       }
+      const launcherPath = windowsLauncherPath(paths);
+      if (launcherPath !== null) {
+        await writeWindowsLauncherFile(launcherPath);
+      }
       await writeFileAtomic(paths.metadataPath, `${JSON.stringify(metadata, null, 2)}\n`);
 
       if (paths.backend === "launchd" && paths.definitionPath !== null) {
@@ -4079,6 +4118,11 @@ function removeServiceFiles(paths: ServicePaths): Effect.Effect<void, unknown> {
   return Effect.tryPromise({
     try: async () => {
       await rm(paths.wrapperPath, { force: true });
+      const launcherPath = windowsLauncherPath(paths);
+      if (launcherPath !== null) {
+        await rm(launcherPath, { force: true });
+        await rm(windowsTaskXmlPath(paths), { force: true });
+      }
       for (const legacyWrapperPath of legacyServiceWrapperPaths(paths)) {
         await rm(legacyWrapperPath, { force: true });
       }
@@ -4086,6 +4130,7 @@ function removeServiceFiles(paths: ServicePaths): Effect.Effect<void, unknown> {
       await rm(paths.runnerPointerPath, { force: true });
       await rm(paths.runnersDir, { force: true, recursive: true });
       await rm(paths.statePath, { force: true });
+      await rm(serviceSourceCadencePath(paths), { force: true });
       await rm(paths.lockPath, { force: true });
       await rm(paths.updateLockPath, { force: true });
       if (paths.definitionPath !== null) {
@@ -4132,23 +4177,78 @@ function installNativeScheduler(paths: ServicePaths): Effect.Effect<void, unknow
     for (const taskName of windowsTaskNames()) {
       yield* runExecutable("schtasks", ["/Delete", "/TN", taskName, "/F"]).pipe(Effect.ignore);
     }
-    yield* runExecutable("schtasks", windowsTaskCreateArgs(paths));
+    const xmlPath = windowsTaskXmlPath(paths);
+    yield* Effect.tryPromise({
+      try: () =>
+        writeFileAtomic(xmlPath, encodeWindowsTaskXml(renderWindowsTaskXml(paths, process.env))),
+      catch: (cause) => cause,
+    });
+    yield* runExecutable("schtasks", windowsTaskCreateArgs(paths)).pipe(
+      Effect.ensuring(Effect.promise(() => rm(xmlPath, { force: true }).catch(() => undefined))),
+    );
   });
 }
 
+// The task is imported from XML rather than built with /TR: schtasks rewrites every ' in the
+// /TR arguments to ", which breaks any launcher path with an apostrophe. The XML keeps the
+// defaults `schtasks /SC MINUTE` used to produce (interactive token, battery conditions, one
+// instance at a time) and only swaps the action.
 function windowsTaskCreateArgs(paths: ServicePaths): string[] {
-  return [
-    "/Create",
-    "/TN",
-    windowsTaskName(),
-    "/SC",
-    "MINUTE",
-    "/MO",
-    String(SERVICE_INTERVAL_MINUTES),
-    "/TR",
-    cmdQuote(paths.wrapperPath),
-    "/F",
-  ];
+  return ["/Create", "/TN", windowsTaskName(), "/XML", windowsTaskXmlPath(paths), "/F"];
+}
+
+// //B keeps script errors from ever raising a dialog and //E pins the VBScript engine.
+function renderWindowsTaskXml(
+  paths: ServicePaths,
+  env: Record<string, string | undefined> = process.env,
+  now = new Date(),
+): string {
+  const launcherPath = join(paths.configDir, WINDOWS_LAUNCHER_NAME);
+
+  return `<?xml version="1.0" encoding="UTF-16"?>\r
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">\r
+  <RegistrationInfo>\r
+    <Description>tokenmaxxing automatic sync</Description>\r
+  </RegistrationInfo>\r
+  <Principals>\r
+    <Principal id="Author">\r
+      <LogonType>InteractiveToken</LogonType>\r
+    </Principal>\r
+  </Principals>\r
+  <Settings>\r
+    <DisallowStartIfOnBatteries>true</DisallowStartIfOnBatteries>\r
+    <StopIfGoingOnBatteries>true</StopIfGoingOnBatteries>\r
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\r
+  </Settings>\r
+  <Triggers>\r
+    <TimeTrigger>\r
+      <StartBoundary>${windowsTaskStartBoundary(now)}</StartBoundary>\r
+      <Repetition>\r
+        <Interval>PT${SERVICE_INTERVAL_MINUTES}M</Interval>\r
+      </Repetition>\r
+    </TimeTrigger>\r
+  </Triggers>\r
+  <Actions Context="Author">\r
+    <Exec>\r
+      <Command>${escapeXml(cmdQuote(windowsScriptHostPath(env)))}</Command>\r
+      <Arguments>${escapeXml(`//B //NoLogo //E:VBScript ${cmdQuote(launcherPath)}`)}</Arguments>\r
+      <WorkingDirectory>${escapeXml(paths.configDir)}</WorkingDirectory>\r
+    </Exec>\r
+  </Actions>\r
+</Task>\r
+`;
+}
+
+// Local wall-clock time, truncated to the minute, like schtasks' own start boundary.
+function windowsTaskStartBoundary(now: Date): string {
+  const pad = (value: number) => String(value).padStart(2, "0");
+
+  return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}T${pad(now.getHours())}:${pad(now.getMinutes())}:00`;
+}
+
+// schtasks reads task XML as UTF-16 LE with a byte-order mark.
+function encodeWindowsTaskXml(xml: string): Uint8Array {
+  return Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(xml, "utf16le")]);
 }
 
 function uninstallNativeScheduler(paths: ServicePaths): Effect.Effect<void, unknown> {
@@ -4267,6 +4367,42 @@ async function isExecutable(path: string, platform: NodeJS.Platform): Promise<bo
   }
 }
 
+// Usage-source roots ccusage reads (one per line). Values are captured
+// literally at install/repair: ccusage splits several of them on commas, so the
+// scheduled run sees exactly what a foreground `sync` in the same shell would.
+// `service doctor` flags drift between these and the current shell.
+const SERVICE_SOURCE_ROOT_ENV_KEYS = [
+  "CLAUDE_CONFIG_DIR",
+  "CODEX_HOME",
+  "HERMES_HOME",
+  "GROK_HOME",
+  "ANTIGRAVITY_DATA_DIR",
+  "ZCODE_HOME",
+  "AMP_DATA_DIR",
+  "QWEN_DATA_DIR",
+  "KIMI_DATA_DIR",
+  "KILO_DATA_DIR",
+  "GOOSE_PATH_ROOT",
+  "DROID_SESSIONS_DIR",
+  "CODEBUFF_DATA_DIR",
+  "OPENCLAW_DIR",
+] as const;
+
+// Environment the scheduled wrapper re-exports; PATH is always set (with a
+// default) and empty or unset values are omitted.
+const SERVICE_ENV_KEYS = [
+  "HOME",
+  "USERPROFILE",
+  "LOCALAPPDATA",
+  "APPDATA",
+  ...SERVICE_SOURCE_ROOT_ENV_KEYS,
+  "TOKENMAXXING_CONFIG_DIR",
+  "TOKENMAXXING_ENV",
+  "TOKENMAXXING_API_URL",
+  "TOKENMAXXING_WWW_URL",
+  SERVICE_RECONCILE_WINDOW_ENV,
+] as const;
+
 function capturedServiceEnv(
   env: Record<string, string | undefined> = process.env,
 ): Record<string, string> {
@@ -4274,18 +4410,7 @@ function capturedServiceEnv(
     PATH: env["PATH"] ?? defaultPath(),
   };
 
-  for (const key of [
-    "HOME",
-    "USERPROFILE",
-    "LOCALAPPDATA",
-    "APPDATA",
-    "HERMES_HOME",
-    "TOKENMAXXING_CONFIG_DIR",
-    "TOKENMAXXING_ENV",
-    "TOKENMAXXING_API_URL",
-    "TOKENMAXXING_WWW_URL",
-    SERVICE_RECONCILE_WINDOW_ENV,
-  ]) {
+  for (const key of SERVICE_ENV_KEYS) {
     const value = env[key];
     if (value !== undefined && value !== "") {
       captured[key] = value;
@@ -4293,6 +4418,72 @@ function capturedServiceEnv(
   }
 
   return captured;
+}
+
+interface ServiceEnvDrift {
+  current: string | undefined;
+  key: string;
+  service: string | undefined;
+}
+
+/**
+ * Compares the source roots baked into an installed wrapper with the current
+ * shell. Roots are only captured at install/repair, so a changed
+ * `CODEX_HOME` silently keeps the service on the old location until repair.
+ */
+function serviceEnvDrift(
+  wrapper: string,
+  env: Record<string, string | undefined> = process.env,
+): ServiceEnvDrift[] {
+  const serviceEnv = parseServiceWrapperEnv(wrapper);
+  const current = capturedServiceEnv(env);
+
+  return SERVICE_SOURCE_ROOT_ENV_KEYS.flatMap((key) =>
+    serviceEnv[key] === current[key]
+      ? []
+      : [{ current: current[key], key, service: serviceEnv[key] }],
+  );
+}
+
+/** Reads back the env lines `renderPosixWrapper`/`renderWindowsWrapper` emit. */
+function parseServiceWrapperEnv(wrapper: string): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const line of wrapper.split(/\r?\n/)) {
+    const posix = /^export ([A-Za-z_][A-Za-z0-9_]*)='(.*)'$/.exec(line);
+    if (posix?.[1] !== undefined && posix[2] !== undefined) {
+      env[posix[1]] = posix[2].replaceAll("'\\''", "'");
+      continue;
+    }
+
+    const windows = /^set "([A-Za-z_][A-Za-z0-9_]*)=(.*)"$/.exec(line);
+    if (windows?.[1] !== undefined && windows[2] !== undefined) {
+      env[windows[1]] = windows[2].replaceAll('\\"', '"');
+    }
+  }
+
+  return env;
+}
+
+function doctorServiceEnvCheck(
+  wrapper: string | null,
+  env: Record<string, string | undefined> = process.env,
+): DoctorCheck {
+  if (wrapper === null) {
+    return doctorCheck("info", "source roots", "not checked (wrapper missing)");
+  }
+
+  const drift = serviceEnvDrift(wrapper, env);
+  if (drift.length === 0) {
+    return doctorCheck("ok", "source roots", "match this shell");
+  }
+
+  const changes = drift
+    .map(
+      ({ current, key, service }) =>
+        `${key} is ${service ?? "unset"} for the service but ${current ?? "unset"} here`,
+    )
+    .join("; ");
+  return doctorCheck("warn", "source roots", `${changes}; repair with ${serviceRepairCommand()}`);
 }
 
 function defaultPath(): string {
@@ -4411,10 +4602,32 @@ function isSameOrChildPath(path: string, parent: string): boolean {
   return path === parent || path.startsWith(normalizedParent);
 }
 
-function autoUpdateCommand(manager: AutoUpdateManager): {
+/**
+ * `specifier` is `latest` (the default) or an exact version; see
+ * `packageManagerSpecifier`. Only `latest` keeps `bun update --latest`,
+ * since bun cannot update to a specific version.
+ */
+function autoUpdateCommand(
+  manager: AutoUpdateManager,
+  specifier: string = LATEST_DIST_TAG,
+): {
   args: string[];
   command: AutoUpdateManager;
 } {
+  if (specifier !== LATEST_DIST_TAG) {
+    const packageSpec = `${PACKAGE_NAME}@${specifier}`;
+    switch (manager) {
+      case "bun":
+        return { args: ["add", "-g", packageSpec, "--silent"], command: "bun" };
+      case "npm":
+        return { args: ["install", "-g", packageSpec, "--silent"], command: "npm" };
+      case "pnpm":
+        return { args: ["add", "-g", packageSpec, "--silent"], command: "pnpm" };
+      case "yarn":
+        return { args: ["global", "add", packageSpec, "--silent"], command: "yarn" };
+    }
+  }
+
   switch (manager) {
     case "bun":
       return {
@@ -4439,10 +4652,23 @@ function autoUpdateCommand(manager: AutoUpdateManager): {
   }
 }
 
-function autoUpdateCommandDescription(manager: AutoUpdateManager): string {
-  const { command, args } = autoUpdateCommand(manager);
+function autoUpdateCommandDescription(
+  manager: AutoUpdateManager,
+  specifier: string = LATEST_DIST_TAG,
+): string {
+  const { command, args } = autoUpdateCommand(manager, specifier);
 
   return [command, ...args].join(" ");
+}
+
+/**
+ * What the package manager installs for an update target: `latest` when the
+ * target is the `latest` dist-tag (keeps the familiar commands), otherwise
+ * the exact verified version, so a dist-tag that moves between the check and
+ * the install can never swap in a different (possibly older) release.
+ */
+function packageManagerSpecifier(target: DistTagVersion): string {
+  return target.distTag === LATEST_DIST_TAG ? LATEST_DIST_TAG : target.version;
 }
 
 function readServiceMetadata(path: string): Effect.Effect<ServiceMetadata | null, never> {
@@ -4458,6 +4684,34 @@ function isServiceInstalled(paths: ServicePaths): Effect.Effect<boolean, never> 
   }
 
   return paths.definitionPath === null ? Effect.succeed(false) : fileExists(paths.definitionPath);
+}
+
+// Leaves a current launcher untouched so a running wscript.exe never sees it replaced.
+async function writeWindowsLauncherFile(path: string): Promise<void> {
+  const current = await readFile(path, "utf8").catch(() => null);
+  if (current !== renderWindowsLauncher()) {
+    await writeFileAtomic(path, renderWindowsLauncher());
+  }
+}
+
+function writeWindowsLauncher(path: string): Effect.Effect<void, unknown> {
+  return Effect.tryPromise({
+    try: () => writeWindowsLauncherFile(path),
+    catch: (cause) => cause,
+  });
+}
+
+function readWindowsLauncherStatus(path: string): Effect.Effect<WindowsLauncherStatus, never> {
+  return Effect.tryPromise({
+    try: () => readFile(path, "utf8"),
+    catch: (cause) => cause,
+  }).pipe(
+    Effect.map(
+      (content): WindowsLauncherStatus =>
+        content === renderWindowsLauncher() ? "current" : "outdated",
+    ),
+    Effect.catch(() => Effect.succeed<WindowsLauncherStatus>("missing")),
+  );
 }
 
 function fileExists(path: string): Effect.Effect<boolean, never> {
@@ -4524,8 +4778,9 @@ function cmdQuote(value: string): string {
   return `"${value.replaceAll('"', '\\"')}"`;
 }
 
+// A batch file expands %NAME% even inside quotes; %% is a literal percent sign.
 function escapeCmdSetValue(value: string): string {
-  return value.replaceAll('"', '\\"');
+  return value.replaceAll('"', '\\"').replaceAll("%", "%%");
 }
 
 function systemdQuote(value: string): string {
@@ -4545,6 +4800,9 @@ export {
   autoUpdateCommandDescription,
   backendForPlatform,
   capturedServiceEnv,
+  doctorServiceEnvCheck,
+  parseServiceWrapperEnv,
+  serviceEnvDrift,
   deferredServiceRepairInvocation,
   durableTokenmaxxingCommandPath,
   detectAutoUpdateManager,
@@ -4559,11 +4817,14 @@ export {
   deterministicServiceJitterMs,
   readServiceMetadata,
   readCurrentServiceRunnerInstall,
+  readWindowsLauncherStatus,
+  removeServiceFiles,
   resolveExecutableSiblingPackageJson,
   resolveServiceRunnerPackageJson,
   renderLaunchdPlist,
   renderServiceWrapper,
   renderSystemdTimer,
+  renderWindowsLauncher,
   refreshServiceAfterUpdate,
   installServiceRunner,
   installServiceRunnerForRepair,
@@ -4575,11 +4836,10 @@ export {
   serviceRepairCanInstallScheduler,
   serviceLockCanBeReplaced,
   serviceRepairNeedsSchedulerInstall,
+  serviceReloadRequired,
   serviceRepairReason,
   serviceRepairState,
   serviceRunnerPackageName,
-  serviceRunnerReleaseChannel,
-  serviceRunnerReleaseIsNewer,
   serviceRunnerTarget,
   serviceRunnerTargetCandidates,
   serviceCompletedUsageReplacementBackfill,
@@ -4599,10 +4859,18 @@ export {
   serviceRunLogLine,
   writeServiceCheckIn,
   serviceRunSuccessState,
+  packageManagerSpecifier,
   runPackageManagerUpdate,
   verifyNpmIntegrity,
+  waitForServiceRunExit,
+  encodeWindowsTaskXml,
+  renderWindowsTaskXml,
+  windowsLauncherDoctorCheck,
+  windowsLauncherPath,
+  windowsScriptHostPath,
   windowsTaskNames,
   windowsTaskCreateArgs,
+  writeServiceFiles,
   ServiceCommandNotFoundError,
   ServiceEnvTokenError,
   ServiceEphemeralCommandError,
