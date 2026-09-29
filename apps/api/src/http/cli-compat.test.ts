@@ -11,6 +11,7 @@ import {
   LoginCodeNotFound,
   TokenId,
   TokenmaxxingApi,
+  type UsageDayInput,
   UserId,
 } from "@tokenmaxxing/api-contract";
 
@@ -22,6 +23,11 @@ import { LeaderboardService } from "../leaderboard/service";
 import { OAuthProviders } from "../oauth/registry";
 import { ProfilesService } from "../profiles/service";
 import { StatsService } from "../stats/service";
+import {
+  CCUSAGE_FIXTURE_SOURCES,
+  ccusageDailyCommand,
+  ccusageDailyFixture,
+} from "../testing/ccusage-fixtures";
 import { makeTestLogger, type TestLogger } from "../testing/logger";
 import { TokensService } from "../tokens/service";
 import { makeUsageService, UsageRepository, UsageService } from "../usage/service";
@@ -205,7 +211,6 @@ beforeAll(async () => {
   const config = AppConfig.of({
     adminEmails: [],
     apiWorkerName: "tokenmaxxing-api",
-    corsOrigins: ["https://tokenmaxxing.sh"],
     github: { clientId: "github", clientSecret: "secret" },
     google: { clientId: "google", clientSecret: "secret" },
     productName: "Tokenmaxxing",
@@ -500,7 +505,7 @@ describe("ingest boundary", () => {
     const [report] = body.reports;
     for (const invalid of [
       { ...body, reports: [{ ...report, extra: 1 }] },
-      { ...body, reports: [{ ...report, source: "openclaw" }] },
+      { ...body, reports: [{ ...report, source: "cursor" }] },
       { ...body, sourceStats: [{ sessionCount: -1, source: "codex" }] },
       { ...body, sourceStats: [{ sessionCount: "NaN", source: "codex" }] },
       { ...body, reports: Array(65).fill(report) },
@@ -535,6 +540,36 @@ describe("ingest boundary", () => {
 
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({ received: 1, upserted: 1 });
+  });
+
+  it("accepts every ccusage-backed source in one upload", async () => {
+    usageRepository.upsertChunk.mockClear();
+    usageRepository.upsertSourceStats.mockClear();
+    // The app clock is 2026-06-21; move the captured days before it.
+    const pastDays = (source: (typeof CCUSAGE_FIXTURE_SOURCES)[number]) => ({
+      daily: ccusageDailyFixture(source).daily.map((day, index) => ({
+        ...day,
+        date: `2026-06-1${index}`,
+      })),
+    });
+    const response = await send(ingest, {
+      device: { name: "fixture-host", platform: "darwin" },
+      reports: CCUSAGE_FIXTURE_SOURCES.map((source) => ({
+        command: ccusageDailyCommand(source),
+        payload: pastDays(source),
+        reportKind: "daily",
+        source,
+      })),
+      sourceStats: CCUSAGE_FIXTURE_SOURCES.map((source) => ({ sessionCount: 2, source })),
+    });
+
+    expect(response.status).toBe(200);
+    const upserted = (
+      usageRepository.upsertChunk.mock.calls as unknown as Array<[string, string, UsageDayInput[]]>
+    ).flatMap(([, , rows]) => rows);
+    expect(new Set(upserted.map((row) => row.source))).toEqual(new Set(CCUSAGE_FIXTURE_SOURCES));
+    expect(upserted.some((row) => row.model.startsWith("[openclaw]"))).toBe(false);
+    expect(usageRepository.upsertSourceStats).toHaveBeenCalledOnce();
   });
 
   it("rejects a daily report over the day cap instead of silently dropping it", async () => {

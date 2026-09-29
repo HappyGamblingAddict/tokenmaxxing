@@ -1,3 +1,7 @@
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { Cause, Effect, Option } from "effect";
 import { describe, expect, it, vi } from "vite-plus/test";
 
@@ -32,9 +36,9 @@ async function ccusageErrorFor<A>(effect: Effect.Effect<A, CcusageRunError>) {
 }
 
 describe("ccusage commands", () => {
-  it("uses the minimum v20 release with the Codex replay fix", () => {
+  it("uses the minimum v20 release that ships every supported adapter", () => {
     expect(dailyCcusageCommand(codex)).toEqual([
-      "ccusage@^20.0.19",
+      "ccusage@^20.0.22",
       "codex",
       "daily",
       "--json",
@@ -43,7 +47,7 @@ describe("ccusage commands", () => {
       "calculate",
     ]);
     expect(sessionCcusageCommand(codex)).toEqual([
-      "ccusage@^20.0.19",
+      "ccusage@^20.0.22",
       "codex",
       "session",
       "--json",
@@ -54,7 +58,7 @@ describe("ccusage commands", () => {
 
   it("builds focused Pi daily and session commands", () => {
     expect(dailyCcusageCommand(pi)).toEqual([
-      "ccusage@^20.0.19",
+      "ccusage@^20.0.22",
       "pi",
       "daily",
       "--json",
@@ -63,7 +67,7 @@ describe("ccusage commands", () => {
       "calculate",
     ]);
     expect(sessionCcusageCommand(pi)).toEqual([
-      "ccusage@^20.0.19",
+      "ccusage@^20.0.22",
       "pi",
       "session",
       "--json",
@@ -74,7 +78,7 @@ describe("ccusage commands", () => {
 
   it("builds focused Hermes daily and session commands", () => {
     expect(dailyCcusageCommand(hermes)).toEqual([
-      "ccusage@^20.0.19",
+      "ccusage@^20.0.22",
       "hermes",
       "daily",
       "--json",
@@ -83,7 +87,7 @@ describe("ccusage commands", () => {
       "calculate",
     ]);
     expect(sessionCcusageCommand(hermes)).toEqual([
-      "ccusage@^20.0.19",
+      "ccusage@^20.0.22",
       "hermes",
       "session",
       "--json",
@@ -97,17 +101,17 @@ describe("ccusageCommandInvocations", () => {
   it("selects the Windows npm command shim", () => {
     expect(ccusageCommandInvocations(["codex", "daily"], "win32")).toEqual([
       {
-        args: ["/d", "/s", "/c", "npx.cmd", "-y", "ccusage@^20.0.19", "codex", "daily"],
+        args: ["/d", "/s", "/c", "npx.cmd", "-y", "ccusage@^20.0.22", "codex", "daily"],
         command: "cmd.exe",
       },
-      { args: ["x", "ccusage@^20.0.19", "codex", "daily"], command: "bun" },
+      { args: ["x", "ccusage@^20.0.22", "codex", "daily"], command: "bun" },
     ]);
   });
 
   it("keeps the POSIX npm fallback", () => {
     expect(ccusageCommandInvocations(["codex", "daily"], "linux")).toEqual([
-      { args: ["x", "ccusage@^20.0.19", "codex", "daily"], command: "bun" },
-      { args: ["-y", "ccusage@^20.0.19", "codex", "daily"], command: "npx" },
+      { args: ["x", "ccusage@^20.0.22", "codex", "daily"], command: "bun" },
+      { args: ["-y", "ccusage@^20.0.22", "codex", "daily"], command: "npx" },
     ]);
   });
 });
@@ -122,16 +126,11 @@ describe("execCcusage", () => {
       ),
     ).resolves.toBe('{"daily":[]}');
     expect(run).toHaveBeenCalledOnce();
-    expect(run).toHaveBeenCalledWith("cmd.exe", [
-      "/d",
-      "/s",
-      "/c",
-      "npx.cmd",
-      "-y",
-      "ccusage@^20.0.19",
-      "codex",
-      "daily",
-    ]);
+    expect(run).toHaveBeenCalledWith(
+      "cmd.exe",
+      ["/d", "/s", "/c", "npx.cmd", "-y", "ccusage@^20.0.22", "codex", "daily"],
+      process.env,
+    );
   });
 
   it("falls back to Bun when npm is missing on Windows", async () => {
@@ -151,17 +150,18 @@ describe("execCcusage", () => {
         execCcusage(["codex", "daily"], "codex", "daily", { platform: "win32", run }),
       ),
     ).resolves.toBe('{"daily":[]}');
-    expect(run).toHaveBeenNthCalledWith(1, "cmd.exe", [
-      "/d",
-      "/s",
-      "/c",
-      "npx.cmd",
-      "-y",
-      "ccusage@^20.0.19",
-      "codex",
-      "daily",
-    ]);
-    expect(run).toHaveBeenNthCalledWith(2, "bun", ["x", "ccusage@^20.0.19", "codex", "daily"]);
+    expect(run).toHaveBeenNthCalledWith(
+      1,
+      "cmd.exe",
+      ["/d", "/s", "/c", "npx.cmd", "-y", "ccusage@^20.0.22", "codex", "daily"],
+      process.env,
+    );
+    expect(run).toHaveBeenNthCalledWith(
+      2,
+      "bun",
+      ["x", "ccusage@^20.0.22", "codex", "daily"],
+      process.env,
+    );
   });
 
   it("does not mask an npm execution failure with the Bun fallback", async () => {
@@ -194,6 +194,65 @@ describe("execCcusage", () => {
     expect(error.code).toBe("command_timed_out");
     expect(error.report).toBe("daily");
     expect(run).toHaveBeenCalledOnce();
+  });
+
+  // Discovery walks the real filesystem, so the simulated POSIX host needs POSIX paths.
+  it.skipIf(process.platform === "win32")(
+    "runs Hermes with discovered profile roots on both the Bun and npm paths",
+    async () => {
+      const home = await mkdtemp(join(tmpdir(), "tokenmaxxing-runner-hermes-"));
+      try {
+        const hermesRoot = join(home, ".hermes");
+        const profile = join(hermesRoot, "profiles", "work");
+        await mkdir(profile, { recursive: true });
+        await writeFile(join(hermesRoot, "state.db"), "default");
+        await writeFile(join(profile, "state.db"), "work");
+        const realRoot = await realpath(hermesRoot);
+        const missingBun = new CcusageRunError({
+          cause: Object.assign(new Error("bun not found"), { code: "ENOENT" }),
+          code: "command_not_found",
+          report: "daily",
+          source: "hermes",
+        });
+        const run = vi
+          .fn()
+          .mockReturnValueOnce(Effect.fail(missingBun))
+          .mockReturnValueOnce(Effect.succeed('{"daily":[]}'));
+
+        await Effect.runPromise(
+          execCcusage(["hermes", "daily"], "hermes", "daily", {
+            env: { HOME: home, PATH: "/usr/bin" },
+            platform: "linux",
+            run,
+          }),
+        );
+
+        const expectedEnv = {
+          HERMES_HOME: `${realRoot},${join(realRoot, "profiles", "work")}`,
+          HOME: home,
+          PATH: "/usr/bin",
+        };
+        expect(run).toHaveBeenNthCalledWith(1, "bun", expect.any(Array), expectedEnv);
+        expect(run).toHaveBeenNthCalledWith(2, "npx", expect.any(Array), expectedEnv);
+      } finally {
+        await rm(home, { force: true, recursive: true });
+      }
+    },
+  );
+
+  it("passes explicit source roots through unchanged", async () => {
+    const env = {
+      CLAUDE_CONFIG_DIR: "/data/Claude Logs, extra",
+      HERMES_HOME: "/data/hermes",
+      HOME: "/home/alex",
+    };
+    const run = vi.fn(() => Effect.succeed('{"daily":[]}'));
+
+    await Effect.runPromise(
+      execCcusage(["hermes", "daily"], "hermes", "daily", { env, platform: "linux", run }),
+    );
+
+    expect(run).toHaveBeenCalledWith("bun", expect.any(Array), env);
   });
 });
 

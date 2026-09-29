@@ -1,7 +1,9 @@
+import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { delimiter, dirname, join } from "node:path";
+import { delimiter, dirname, join, win32 } from "node:path";
+import { promisify } from "node:util";
 import { gzipSync } from "node:zlib";
 
 import { Cause, Effect, Layer } from "effect";
@@ -24,6 +26,9 @@ import {
   backendForPlatform,
   capturedServiceEnv,
   deferredServiceRepairInvocation,
+  doctorServiceEnvCheck,
+  parseServiceWrapperEnv,
+  serviceEnvDrift,
   detectAutoUpdateManager,
   deterministicServiceJitterMs,
   durableTokenmaxxingCommandPath,
@@ -38,20 +43,22 @@ import {
   isTransientCommandShimPath,
   legacyServiceWrapperPaths,
   readCurrentServiceRunnerInstall,
+  readWindowsLauncherStatus,
+  removeServiceFiles,
   resolveExecutableSiblingPackageJson,
   renderLaunchdPlist,
   renderServiceWrapper,
   renderSystemdTimer,
+  renderWindowsLauncher,
   runServiceAutoUpdate,
   scheduleDescription,
   serviceLockCanBeReplaced,
   serviceRepairCanInstallScheduler,
+  serviceReloadRequired,
   serviceRepairNeedsSchedulerInstall,
   serviceRepairReason,
   serviceRepairState,
   serviceRunnerPackageName,
-  serviceRunnerReleaseChannel,
-  serviceRunnerReleaseIsNewer,
   serviceRunnerTarget,
   serviceCompletedUsageReplacementBackfill,
   serviceNeedsUsageReplacementBackfill,
@@ -73,8 +80,15 @@ import {
   servicePaths,
   serviceStateJson,
   verifyNpmIntegrity,
+  waitForServiceRunExit,
+  encodeWindowsTaskXml,
+  renderWindowsTaskXml,
+  windowsLauncherDoctorCheck,
+  windowsLauncherPath,
+  windowsScriptHostPath,
   windowsTaskCreateArgs,
   windowsTaskNames,
+  writeServiceFiles,
 } from "./service";
 import type { SyncResult } from "./sync";
 
@@ -224,27 +238,6 @@ function makeTestLayer(options: TestLayerOptions) {
 
   return { layer, state };
 }
-
-describe("service runner update versions", () => {
-  it("derives the npm release channel from the current runner version", () => {
-    expect(serviceRunnerReleaseChannel("0.4.18")).toBe("latest");
-    expect(serviceRunnerReleaseChannel("v0.4.18")).toBe("latest");
-    expect(serviceRunnerReleaseChannel("0.4.18-alpha.1")).toBe("alpha");
-    expect(serviceRunnerReleaseChannel("0.4.18-beta.2")).toBe("beta");
-    expect(serviceRunnerReleaseChannel("0.4.18-rc.0+build")).toBe("rc");
-  });
-
-  it("only treats strictly newer semver-like runner versions as installable", () => {
-    expect(serviceRunnerReleaseIsNewer("0.4.18", "0.4.19")).toBe(true);
-    expect(serviceRunnerReleaseIsNewer("0.4.18", "0.5.0")).toBe(true);
-    expect(serviceRunnerReleaseIsNewer("0.4.18", "1.0.0")).toBe(true);
-    expect(serviceRunnerReleaseIsNewer("0.4.18", "0.4.18")).toBe(false);
-    expect(serviceRunnerReleaseIsNewer("0.4.18", "0.4.17")).toBe(false);
-    expect(serviceRunnerReleaseIsNewer("0.4.18-alpha.1", "0.4.18-alpha.2")).toBe(true);
-    expect(serviceRunnerReleaseIsNewer("0.4.18-alpha.2", "0.4.18-alpha.1")).toBe(false);
-    expect(serviceRunnerReleaseIsNewer("0.4.18-alpha.1", "0.4.18")).toBe(true);
-  });
-});
 
 function makeInstallRuntime(
   options: { env?: Record<string, string | undefined>; install?: CommandInstall } = {},
@@ -486,7 +479,186 @@ describe("servicePaths", () => {
   });
 });
 
+const execFileAsync = promisify(execFile);
+
+describe("capturedServiceEnv", () => {
+  it("captures nonempty source roots literally and omits empty ones", () => {
+    expect(
+      capturedServiceEnv({
+        CLAUDE_CONFIG_DIR: "/data/Claude Logs, extra",
+        CODEX_HOME: "/data/Codex Logs",
+        HERMES_HOME: "/data/hermes,/data/hermes/profiles/work",
+        HOME: "/home/alex",
+        PATH: "/usr/bin",
+        TOKENMAXXING_API_TOKEN: "tmx_secret",
+      }),
+    ).toEqual({
+      CLAUDE_CONFIG_DIR: "/data/Claude Logs, extra",
+      CODEX_HOME: "/data/Codex Logs",
+      HERMES_HOME: "/data/hermes,/data/hermes/profiles/work",
+      HOME: "/home/alex",
+      PATH: "/usr/bin",
+    });
+
+    expect(
+      capturedServiceEnv({
+        CLAUDE_CONFIG_DIR: "",
+        CODEX_HOME: undefined,
+        HERMES_HOME: "",
+        HOME: "/home/alex",
+        PATH: "/usr/bin",
+      }),
+    ).toEqual({ HOME: "/home/alex", PATH: "/usr/bin" });
+  });
+});
+
+describe("capturedServiceEnv agent data directories", () => {
+  it("carries every agent's custom data directory into scheduled syncs", () => {
+    const agentDirs = {
+      AMP_DATA_DIR: "/data/amp",
+      ANTIGRAVITY_DATA_DIR: "/data/antigravity",
+      CODEBUFF_DATA_DIR: "/data/codebuff",
+      DROID_SESSIONS_DIR: "/data/droid",
+      GOOSE_PATH_ROOT: "/data/goose",
+      GROK_HOME: "/data/grok",
+      KILO_DATA_DIR: "/data/kilo",
+      KIMI_DATA_DIR: "/data/kimi",
+      OPENCLAW_DIR: "/data/openclaw",
+      QWEN_DATA_DIR: "/data/qwen",
+      ZCODE_HOME: "/data/zcode",
+    };
+
+    expect(capturedServiceEnv({ ...agentDirs, GROK_API_KEY: "secret", PATH: "/usr/bin" })).toEqual({
+      ...agentDirs,
+      PATH: "/usr/bin",
+    });
+  });
+});
+
+describe("serviceEnvDrift", () => {
+  const shell = {
+    CLAUDE_CONFIG_DIR: "/data/Claude Logs, it's mine",
+    CODEX_HOME: 'C:\\Users\\alex\\Codex "Logs"',
+    HOME: "/home/alex",
+    PATH: "/usr/bin",
+  };
+
+  for (const platform of ["linux", "win32"] as const) {
+    it(`round-trips the source roots of a ${platform} wrapper`, () => {
+      const wrapper = renderServiceWrapper({
+        env: capturedServiceEnv(shell),
+        logPath: "/tmp/tokenmaxxing.log",
+        platform,
+        runnerPointerPath: "/tmp/service-runner-current",
+      });
+
+      expect(parseServiceWrapperEnv(wrapper)).toMatchObject({
+        CLAUDE_CONFIG_DIR: shell.CLAUDE_CONFIG_DIR,
+        CODEX_HOME: shell.CODEX_HOME,
+      });
+      expect(serviceEnvDrift(wrapper, shell)).toEqual([]);
+    });
+  }
+
+  it("reports roots that changed, appeared, or disappeared since install", () => {
+    const wrapper = renderServiceWrapper({
+      env: capturedServiceEnv({ ...shell, HERMES_HOME: "/data/hermes" }),
+      logPath: "/tmp/tokenmaxxing.log",
+      platform: "linux",
+      runnerPointerPath: "/tmp/service-runner-current",
+    });
+
+    expect(
+      serviceEnvDrift(wrapper, {
+        ...shell,
+        CLAUDE_CONFIG_DIR: "/data/claude-new",
+        CODEX_HOME: "",
+      }),
+    ).toEqual([
+      {
+        current: "/data/claude-new",
+        key: "CLAUDE_CONFIG_DIR",
+        service: shell.CLAUDE_CONFIG_DIR,
+      },
+      { current: undefined, key: "CODEX_HOME", service: shell.CODEX_HOME },
+      { current: undefined, key: "HERMES_HOME", service: "/data/hermes" },
+    ]);
+  });
+
+  it("nudges doctor users to repair when roots drifted", () => {
+    const wrapper = renderServiceWrapper({
+      env: capturedServiceEnv({ CODEX_HOME: "/data/codex-old", PATH: "/usr/bin" }),
+      logPath: "/tmp/tokenmaxxing.log",
+      platform: "linux",
+      runnerPointerPath: "/tmp/service-runner-current",
+    });
+
+    expect(doctorServiceEnvCheck(wrapper, { CODEX_HOME: "/data/codex-old" })).toEqual({
+      detail: "match this shell",
+      label: "source roots",
+      status: "ok",
+    });
+    expect(doctorServiceEnvCheck(wrapper, { CODEX_HOME: "/data/codex" })).toEqual({
+      detail:
+        "CODEX_HOME is /data/codex-old for the service but /data/codex here; repair with tokenmaxxing service repair",
+      label: "source roots",
+      status: "warn",
+    });
+    expect(doctorServiceEnvCheck(null, {}).status).toBe("info");
+  });
+});
+
 describe("renderServiceWrapper", () => {
+  it.skipIf(process.platform === "win32")(
+    "exports captured source roots with spaces, commas, and quotes to the runner",
+    async () => {
+      const root = await mkdtemp(join(tmpdir(), "tokenmaxxing-service-env-"));
+      try {
+        const runnerPath = join(root, "fake-runner");
+        const pointerPath = join(root, "service-runner-current");
+        const logPath = join(root, "service.log");
+        const claudeRoot = join(root, "Claude Logs, extra");
+        const codexRoot = join(root, "Codex's Logs");
+        await writeFile(
+          runnerPath,
+          `#!/bin/sh
+printf 'CLAUDE_CONFIG_DIR=%s\\n' "$CLAUDE_CONFIG_DIR"
+printf 'CODEX_HOME=%s\\n' "$CODEX_HOME"
+printf 'HERMES_HOME=%s\\n' "\${HERMES_HOME-unset}"
+`,
+          { encoding: "utf8", mode: 0o755 },
+        );
+        await writeFile(pointerPath, `${runnerPath}\n`, "utf8");
+        const wrapperPath = join(root, "tokenmaxxing.sh");
+        await writeFile(
+          wrapperPath,
+          renderServiceWrapper({
+            env: capturedServiceEnv({
+              CLAUDE_CONFIG_DIR: claudeRoot,
+              CODEX_HOME: codexRoot,
+              HERMES_HOME: "",
+              HOME: root,
+              PATH: "/usr/bin:/bin",
+            }),
+            logPath,
+            platform: "linux",
+            runnerPointerPath: pointerPath,
+          }),
+          { encoding: "utf8", mode: 0o755 },
+        );
+
+        await execFileAsync("/bin/sh", [wrapperPath], { env: {}, timeout: 5000 });
+
+        const log = await readFile(logPath, "utf8");
+        expect(log).toContain(`CLAUDE_CONFIG_DIR=${claudeRoot}\n`);
+        expect(log).toContain(`CODEX_HOME=${codexRoot}\n`);
+        expect(log).toContain("HERMES_HOME=unset\n");
+      } finally {
+        await rm(root, { force: true, recursive: true });
+      }
+    },
+  );
+
   it("runs sync with a durable command without embedding package-manager updates", () => {
     const env = capturedServiceEnv({
       HERMES_HOME: "/data/hermes",
@@ -550,7 +722,11 @@ describe("renderServiceWrapper", () => {
 
   it("renders Windows wrappers without package-manager updates", () => {
     const wrapper = renderServiceWrapper({
-      env: { PATH: "/usr/bin" },
+      env: capturedServiceEnv({
+        CLAUDE_CONFIG_DIR: "D:\\Claude Logs, extra",
+        CODEX_HOME: "C:\\Users\\alex\\Codex Logs",
+        PATH: "C:\\Windows\\System32",
+      }),
       logPath: "/tmp/tokenmaxxing.log",
       platform: "win32",
       runnerPointerPath: "C:\\Users\\alex\\AppData\\Roaming\\tokenmaxxing\\service-runner-current",
@@ -566,6 +742,45 @@ describe("renderServiceWrapper", () => {
     expect(wrapper).toContain('move /y "%TOKENMAXXING_LOG%" "%TOKENMAXXING_LOG%.1"');
     expect(wrapper).toContain("set /p TOKENMAXXING_SERVICE_RUNNER=<");
     expect(wrapper).toContain("service run --scheduled");
+    expect(wrapper).toContain('set "CLAUDE_CONFIG_DIR=D:\\Claude Logs, extra"\r\n');
+    expect(wrapper).toContain('set "CODEX_HOME=C:\\Users\\alex\\Codex Logs"\r\n');
+  });
+
+  it("addresses its own files through %~dp0 so no profile path is embedded", () => {
+    const configDir = "C:\\Users\\Zoë O'Neil (Work)\\Tm & Co\\tokenmaxxing";
+    const wrapper = renderServiceWrapper({
+      env: { PATH: "C:\\Program Files (x86)\\Tools;C:\\100%\\bin" },
+      logPath: `${configDir}\\service.log`,
+      platform: "win32",
+      runnerPointerPath: `${configDir}\\service-runner-current`,
+    });
+    const lines = wrapper.split("\r\n");
+
+    expect(wrapper.endsWith("\r\n")).toBe(true);
+    expect(wrapper.replaceAll("\r\n", "")).not.toMatch(/[\r\n]/);
+    expect(wrapper).not.toContain(configDir);
+    expect(wrapper).not.toContain("Zo");
+    expect(lines[1]).toBe('"%SystemRoot%\\System32\\chcp.com" 65001 >nul');
+    expect(lines).toContain('set "TOKENMAXXING_LOG=%~dp0service.log"');
+    expect(lines).toContain('set /p TOKENMAXXING_SERVICE_RUNNER=<"%~dp0service-runner-current"');
+    // A literal percent sign must not start a variable expansion.
+    expect(lines).toContain('set "PATH=C:\\Program Files (x86)\\Tools;C:\\100%%\\bin"');
+    // The runner path may contain & ( ): expand it only inside quotes, never inside a block.
+    expect(lines).toContain("if not defined TOKENMAXXING_SERVICE_RUNNER goto runner_pointer_empty");
+    expect(lines).toContain('if not exist "%TOKENMAXXING_SERVICE_RUNNER%" goto runner_missing');
+    expect(lines).toContain(
+      '"%TOKENMAXXING_SERVICE_RUNNER%" service run --scheduled >> "%TOKENMAXXING_LOG%" 2>&1',
+    );
+    expect(lines).toContain(
+      '>> "%TOKENMAXXING_LOG%" echo tokenmaxxing service runner missing: "%TOKENMAXXING_SERVICE_RUNNER%"',
+    );
+    for (const line of lines) {
+      expect(line.replaceAll(/"[^"]*"/g, '""')).not.toContain("%TOKENMAXXING_SERVICE_RUNNER%");
+    }
+    const blockStart = lines.findIndex((line) => line.endsWith("("));
+    const blockEnd = lines.indexOf(")");
+    expect(lines.filter((line) => line.endsWith("(")).length).toBe(1);
+    expect(lines.slice(blockStart, blockEnd).join("\n")).not.toContain("SERVICE_RUNNER");
   });
 });
 
@@ -600,16 +815,383 @@ describe("native scheduler templates", () => {
       "/Create",
       "/TN",
       "tokenmaxxing-sync",
-      "/SC",
-      "MINUTE",
-      "/MO",
-      "5",
-      "/TR",
-      '"C:\\Users\\alex\\AppData\\Roaming\\tokenmaxxing\\service-sync.cmd"',
+      "/XML",
+      join(windowsPaths!.configDir, "service-task.xml"),
       "/F",
     ]);
+    expect(
+      renderWindowsTaskXml(
+        windowsPaths!,
+        { SystemRoot: "C:\\Windows" },
+        new Date(2026, 8, 5, 7, 3, 44),
+      ),
+    ).toContain(
+      "<TimeTrigger>\r\n      <StartBoundary>2026-09-05T07:03:00</StartBoundary>\r\n      <Repetition>\r\n        <Interval>PT5M</Interval>",
+    );
   });
 });
+
+describe("Windows hidden launcher", () => {
+  const windowsPaths = (configDir: string) =>
+    servicePaths({
+      env: { TOKENMAXXING_CONFIG_DIR: configDir },
+      home: "C:\\Users\\alex",
+      platform: "win32",
+    })!;
+
+  it("imports a task that starts the launcher through wscript", () => {
+    const paths = windowsPaths(
+      "C:\\Users\\Zoë O'Neil (Work)\\AppData\\Roaming\\token maxxing & <co>",
+    );
+    const xml = renderWindowsTaskXml(paths, { SystemRoot: "D:\\WINDOWS\\" });
+    const exec = {
+      arguments: xmlElementText(xml, "Arguments"),
+      command: xmlElementText(xml, "Command"),
+      workingDirectory: xmlElementText(xml, "WorkingDirectory"),
+    };
+
+    // Task Scheduler splits Command/Arguments like any Windows command line and wscript parses
+    // its own arguments the same way, so the launcher path must survive as one argument. The
+    // apostrophe stays an apostrophe (schtasks /TR would have turned it into a quote).
+    expect(splitWindowsCommandLine(exec.command)).toEqual(["D:\\WINDOWS\\System32\\wscript.exe"]);
+    expect(splitWindowsCommandLine(exec.arguments)).toEqual([
+      "//B",
+      "//NoLogo",
+      "//E:VBScript",
+      windowsLauncherPath(paths),
+    ]);
+    expect(exec.workingDirectory).toBe(paths.configDir);
+    expect(windowsLauncherPath(paths)).toBe(join(paths.configDir, "service-sync.vbs"));
+    expect(xml).not.toContain("service-sync.cmd");
+    expect(xml).toContain("&amp; &lt;co&gt;");
+    expect(xml).toContain("<LogonType>InteractiveToken</LogonType>");
+    expect(xml).toContain("<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>");
+    expect(xml).not.toContain("<UserId>");
+    expect(xml).not.toContain("<RunLevel>HighestAvailable</RunLevel>");
+  });
+
+  it("encodes the task XML as UTF-16 LE with a byte-order mark", () => {
+    const xml = renderWindowsTaskXml(windowsPaths("C:\\Users\\Zoë\\tm"), {});
+    const bytes = Buffer.from(encodeWindowsTaskXml(xml));
+
+    expect(xml.startsWith('<?xml version="1.0" encoding="UTF-16"?>\r\n')).toBe(true);
+    expect([...bytes.subarray(0, 2)]).toEqual([0xff, 0xfe]);
+    expect(bytes.subarray(2).toString("utf16le")).toBe(xml);
+    expect(bytes.subarray(2).toString("utf16le")).toContain("Zoë");
+  });
+
+  it("uses the native System32 script host", () => {
+    expect(windowsScriptHostPath({ SystemRoot: "C:\\Windows" })).toBe(
+      "C:\\Windows\\System32\\wscript.exe",
+    );
+    expect(windowsScriptHostPath({ SYSTEMROOT: "E:\\Win" })).toBe("E:\\Win\\System32\\wscript.exe");
+    expect(windowsScriptHostPath({})).toBe("C:\\Windows\\System32\\wscript.exe");
+    expect(windowsScriptHostPath({ SystemRoot: "C:\\Windows" })).not.toMatch(/SysWOW64|Sysnative/i);
+  });
+
+  it("only tracks a launcher for the Windows backend", () => {
+    const darwinPaths = servicePaths({
+      env: { TOKENMAXXING_CONFIG_DIR: "/tmp/tokenmaxxing" },
+      home: "/Users/alex",
+      platform: "darwin",
+    })!;
+
+    expect(windowsLauncherPath(darwinPaths)).toBeNull();
+  });
+
+  it("renders a pure-ASCII VBScript that hides the wrapper and propagates its exit code", () => {
+    const launcher = renderWindowsLauncher();
+    const lines = launcher.split("\r\n");
+
+    expect(launcher.endsWith("\r\n")).toBe(true);
+    expect(launcher.replaceAll("\r\n", "")).not.toMatch(/[\r\n]/);
+    expect(launcher).toMatch(/^[\x20-\x7e\r\n]*$/);
+    expect(lines).toContain("Option Explicit");
+    expect(lines).toContain(
+      'cmd = """" & shell.ExpandEnvironmentStrings("%SystemRoot%") & "\\System32\\cmd.exe"""',
+    );
+    // The wrapper runs by relative name from the launcher's folder, so no profile path is embedded
+    // or re-parsed by cmd.exe; /d skips AutoRun commands that could change directory.
+    expect(lines).toContain('command = cmd & " /d /c .\\service-sync.cmd"');
+    // The wrapper path is a Windows path, so it needs Windows basename semantics on every host.
+    expect(win32.basename(windowsPaths("C:\\tokenmaxxing").wrapperPath)).toBe("service-sync.cmd");
+    expect(lines).toContain(
+      'shell.CurrentDirectory = Left(WScript.ScriptFullName, InStrRev(WScript.ScriptFullName, "\\"))',
+    );
+    // Style 0 hides the console; waiting returns the wrapper exit code for WScript.Quit.
+    expect(lines).toContain("If Err.Number = 0 Then exitCode = shell.Run(command, 0, True)");
+    expect(lines).toContain("If Err.Number <> 0 Then exitCode = 127");
+    expect(lines.at(-2)).toBe("WScript.Quit exitCode");
+    expect(launcher).not.toMatch(/[A-Z]:\\/);
+    expect(launcher).not.toMatch(/powershell|timeout/i);
+  });
+
+  it("builds the deferred repair command line in the launcher's repair mode", () => {
+    const repairLine = renderWindowsLauncher()
+      .split("\r\n")
+      .find((line) => line.trim().startsWith('command = cmd & " /d /s /c'))!;
+    const commandPath = "C:\\Users\\Zoë O'Neil (Work)\\Tm & Co\\tokenmaxxing.exe";
+    const commandLine = evaluateVbsConcatenation(repairLine.trim().slice("command = ".length), {
+      cmd: '"C:\\Windows\\System32\\cmd.exe"',
+      'shell.Environment("PROCESS")("TOKENMAXXING_SERVICE_REPAIR_COMMAND")': commandPath,
+      "WScript.Arguments(1)": "reload-required",
+    });
+
+    expect(commandLine).toBe(
+      `"C:\\Windows\\System32\\cmd.exe" /d /s /c ""${commandPath}" service repair --deferred --json --reason reload-required"`,
+    );
+    // cmd /s strips exactly the outer pair of quotes, leaving the command path quoted.
+    const afterC = commandLine.slice(commandLine.indexOf(" /c ") + 4);
+    expect(afterC.slice(1, -1)).toBe(
+      `"${commandPath}" service repair --deferred --json --reason reload-required`,
+    );
+  });
+
+  it("passes schtasks and wscript arguments through Windows argv quoting intact", () => {
+    const configDir = "C:\\Users\\Zoë O'Neil (Work)\\token maxxing & co";
+    const args = windowsTaskCreateArgs(windowsPaths(configDir));
+    const repair = deferredServiceRepairInvocation(
+      "C:\\x\\tokenmaxxing.exe",
+      "reload-required",
+      "win32",
+      {
+        SystemRoot: "C:\\Windows",
+        TOKENMAXXING_CONFIG_DIR: configDir,
+      },
+    );
+    // execFile/spawn quote each argument the way libuv does before CreateProcessW; schtasks and
+    // wscript parse their command lines back with CommandLineToArgvW rules.
+    const roundTrip = (argv: string[]) =>
+      splitWindowsCommandLine(argv.map(quoteWindowsArg).join(" "));
+
+    expect(roundTrip(["schtasks", ...args])).toEqual(["schtasks", ...args]);
+    expect(roundTrip([repair.command, ...repair.args])).toEqual([repair.command, ...repair.args]);
+  });
+
+  it("writes the launcher on install and repair and removes it on uninstall", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "tokenmaxxing-windows-launcher-"));
+
+    try {
+      const paths = windowsPaths(join(dir, "Zoë (Work)"));
+      const launcherPath = windowsLauncherPath(paths)!;
+      const metadata: ServiceMetadata = {
+        autoUpdateManager: "registry",
+        backend: "windows-task-scheduler",
+        commandPath: join(paths.runnersDir, "tokenmaxxing.exe"),
+        installedAt: "2026-06-16T09:00:00.000Z",
+        schedule: "syncs every 5 minutes",
+        templateVersion: 6,
+        version: 1,
+      };
+
+      expect(await Effect.runPromise(readWindowsLauncherStatus(launcherPath))).toBe("missing");
+
+      await Effect.runPromise(writeServiceFiles(paths, "@echo off\r\n", metadata));
+      expect(await readFile(launcherPath, "utf8")).toBe(renderWindowsLauncher());
+      expect(await readFile(paths.wrapperPath, "utf8")).toBe("@echo off\r\n");
+      expect(await Effect.runPromise(readWindowsLauncherStatus(launcherPath))).toBe("current");
+
+      // A current launcher is left in place, so a running wscript.exe never sees it replaced.
+      const installedLauncher = await stat(launcherPath);
+      await Effect.runPromise(writeServiceFiles(paths, "@echo off\r\n", metadata));
+      expect((await stat(launcherPath)).ino).toBe(installedLauncher.ino);
+
+      // Repair rewrites an outdated launcher in place.
+      await writeFile(launcherPath, "' stale launcher\r\n");
+      expect(await Effect.runPromise(readWindowsLauncherStatus(launcherPath))).toBe("outdated");
+      await Effect.runPromise(writeServiceFiles(paths, "@echo off\r\n", metadata));
+      expect(await Effect.runPromise(readWindowsLauncherStatus(launcherPath))).toBe("current");
+
+      await writeFile(join(paths.configDir, "service-task.xml"), "leftover");
+      await Effect.runPromise(removeServiceFiles(paths));
+      expect(await Effect.runPromise(readWindowsLauncherStatus(launcherPath))).toBe("missing");
+      await expect(readFile(join(paths.configDir, "service-task.xml"))).rejects.toThrow();
+      await expect(readFile(paths.wrapperPath, "utf8")).rejects.toThrow();
+    } finally {
+      await rm(dir, { force: true, recursive: true });
+    }
+  });
+
+  it("does not write a launcher for POSIX backends", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "tokenmaxxing-posix-launcher-"));
+
+    try {
+      const paths = servicePaths({
+        env: { TOKENMAXXING_CONFIG_DIR: dir, XDG_CONFIG_HOME: join(dir, "xdg") },
+        home: dir,
+        platform: "linux",
+      })!;
+
+      await Effect.runPromise(
+        writeServiceFiles(paths, "#!/bin/sh\n", {
+          backend: "systemd",
+          commandPath: "/usr/local/bin/tokenmaxxing",
+          installedAt: "2026-06-16T09:00:00.000Z",
+          schedule: "syncs every 5 minutes",
+          version: 1,
+        }),
+      );
+
+      expect(
+        await Effect.runPromise(readWindowsLauncherStatus(join(dir, "service-sync.vbs"))),
+      ).toBe("missing");
+    } finally {
+      await rm(dir, { force: true, recursive: true });
+    }
+  });
+
+  it("reports missing or outdated launchers in service doctor", () => {
+    expect(windowsLauncherDoctorCheck("C:\\tm\\service-sync.vbs", "current")).toEqual({
+      detail: "C:\\tm\\service-sync.vbs",
+      label: "launcher",
+      status: "ok",
+    });
+    expect(windowsLauncherDoctorCheck("C:\\tm\\service-sync.vbs", "missing")).toEqual({
+      detail: "C:\\tm\\service-sync.vbs missing; repair with tokenmaxxing service repair",
+      label: "launcher",
+      status: "warn",
+    });
+    expect(windowsLauncherDoctorCheck("C:\\tm\\service-sync.vbs", "outdated").status).toBe("warn");
+  });
+
+  it("marks installs from older templates for repair so their task is re-registered", () => {
+    const metadata: ServiceMetadata = {
+      autoUpdateManager: "registry",
+      backend: "windows-task-scheduler",
+      commandPath: "C:\\tm\\service-runners\\0.7.0\\windows-x64\\tokenmaxxing.exe",
+      installedAt: "2026-06-16T09:00:00.000Z",
+      runnerTarget: "windows-x64",
+      runnerVersion: "0.7.0",
+      schedule: "syncs every 5 minutes",
+      templateVersion: 5,
+      version: 1,
+    };
+
+    expect(serviceReloadRequired(metadata)).toBe(true);
+    expect(serviceReloadRequired({ ...metadata, templateVersion: 6 })).toBe(false);
+    expect(
+      serviceRepairNeedsSchedulerInstall({
+        reason: serviceRepairReason({ reloadRequired: true, schedulerActive: true })!,
+        reloadRequired: true,
+        schedulerActive: true,
+      }),
+    ).toBe(true);
+  });
+});
+
+function xmlElementText(xml: string, name: string): string {
+  const match = new RegExp(`<${name}>([^<]*)</${name}>`).exec(xml);
+  if (match === null) {
+    throw new Error(`missing <${name}>`);
+  }
+
+  return match[1]!
+    .replaceAll("&lt;", "<")
+    .replaceAll("&gt;", ">")
+    .replaceAll("&quot;", '"')
+    .replaceAll("&apos;", "'")
+    .replaceAll("&amp;", "&");
+}
+
+// Evaluates a VBScript `a & "literal" & b` expression: string literals double their quotes, and
+// every other operand is looked up in `values`.
+function evaluateVbsConcatenation(expression: string, values: Record<string, string>): string {
+  let result = "";
+  let rest = expression.trim();
+  while (rest !== "") {
+    if (rest.startsWith('"')) {
+      let index = 1;
+      let literal = "";
+      while (index < rest.length) {
+        if (rest[index] === '"') {
+          if (rest[index + 1] === '"') {
+            literal += '"';
+            index += 2;
+            continue;
+          }
+          break;
+        }
+        literal += rest[index];
+        index += 1;
+      }
+      result += literal;
+      rest = rest.slice(index + 1).trim();
+    } else {
+      const end = rest.indexOf(" & ");
+      const operand = end === -1 ? rest : rest.slice(0, end);
+      if (!(operand in values)) {
+        throw new Error(`unknown VBScript operand ${operand}`);
+      }
+      result += values[operand];
+      rest = end === -1 ? "" : rest.slice(end).trim();
+    }
+    rest = rest.replace(/^&\s*/, "").trim();
+  }
+
+  return result;
+}
+
+// libuv quote_cmd_arg: quote arguments with whitespace or quotes, escape embedded quotes, and
+// double the backslashes that precede an escaped or closing quote.
+function quoteWindowsArg(arg: string): string {
+  if (arg === "") {
+    return '""';
+  }
+  if (!/[\s"]/.test(arg)) {
+    return arg;
+  }
+
+  return `"${arg.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\+)$/, "$1$1")}"`;
+}
+
+// CommandLineToArgvW rules: 2n backslashes + quote -> n backslashes and a quote toggle,
+// 2n+1 backslashes + quote -> n backslashes and a literal quote, other backslashes are literal.
+function splitWindowsCommandLine(commandLine: string): string[] {
+  const args: string[] = [];
+  let current = "";
+  let inQuotes = false;
+  let hasArg = false;
+
+  for (let index = 0; index < commandLine.length; index += 1) {
+    const char = commandLine[index]!;
+    if (char === "\\") {
+      let backslashes = 0;
+      while (commandLine[index] === "\\") {
+        backslashes += 1;
+        index += 1;
+      }
+      if (commandLine[index] === '"') {
+        current += "\\".repeat(Math.floor(backslashes / 2));
+        if (backslashes % 2 === 1) {
+          current += '"';
+        } else {
+          inQuotes = !inQuotes;
+        }
+      } else {
+        current += "\\".repeat(backslashes);
+        index -= 1;
+      }
+      hasArg = true;
+    } else if (char === '"') {
+      inQuotes = !inQuotes;
+      hasArg = true;
+    } else if ((char === " " || char === "\t") && !inQuotes) {
+      if (hasArg) {
+        args.push(current);
+        current = "";
+        hasArg = false;
+      }
+    } else {
+      current += char;
+      hasArg = true;
+    }
+  }
+  if (hasArg) {
+    args.push(current);
+  }
+
+  return args;
+}
 
 describe("legacyServiceWrapperPaths", () => {
   it("tracks old POSIX wrapper names for cleanup", () => {
@@ -784,18 +1366,86 @@ describe("service repair helpers", () => {
       ],
       command: "sh",
     });
+  });
+
+  it("spawns Windows deferred repairs through the hidden launcher", () => {
+    const env = {
+      PATH: "C:\\Windows\\System32",
+      SystemRoot: "C:\\Windows",
+      TOKENMAXXING_CONFIG_DIR: "C:\\Users\\Zoë\\tm",
+    };
+
     expect(
       deferredServiceRepairInvocation(
         "C:\\Users\\alex\\AppData\\Roaming\\npm\\tokenmaxxing.cmd",
         "auto-updated",
         "win32",
-      ).args.at(-1),
-    ).toContain('service repair --deferred --json --reason "auto-updated"');
+        env,
+      ),
+    ).toEqual({
+      args: [
+        "//B",
+        "//NoLogo",
+        "//E:VBScript",
+        join("C:\\Users\\Zoë\\tm", "service-sync.vbs"),
+        "repair",
+        "auto-updated",
+      ],
+      command: "C:\\Windows\\System32\\wscript.exe",
+      options: {
+        detached: true,
+        env: {
+          ...env,
+          TOKENMAXXING_SERVICE_REPAIR_COMMAND:
+            "C:\\Users\\alex\\AppData\\Roaming\\npm\\tokenmaxxing.cmd",
+        },
+        stdio: "ignore",
+        windowsHide: true,
+      },
+    });
+  });
+
+  it("waits for the scheduled sync to release the run lock before a Windows repair", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "tokenmaxxing-repair-wait-"));
+
+    try {
+      const paths = servicePaths({
+        env: { TOKENMAXXING_CONFIG_DIR: dir },
+        home: "C:\\Users\\alex",
+        platform: "win32",
+      })!;
+      await writeFile(
+        paths.lockPath,
+        JSON.stringify({
+          acquiredAt: new Date().toISOString(),
+          ownerId: "sync",
+          pid: 1,
+          version: 1,
+        }),
+      );
+      const sleeps: number[] = [];
+      const clock = Layer.succeed(ClockService)({
+        sleep: (ms: number) =>
+          Effect.promise(async () => {
+            sleeps.push(ms);
+            if (sleeps.length === 2) {
+              await rm(paths.lockPath, { force: true });
+            }
+          }),
+      });
+
+      await Effect.runPromise(waitForServiceRunExit(paths).pipe(Effect.provide(clock)));
+
+      expect(sleeps).toEqual([500, 500, 2000]);
+    } finally {
+      await rm(dir, { force: true, recursive: true });
+    }
   });
 
   it("schedules linux deferred repairs with systemd-run outside the current service cgroup", () => {
     expect(
       deferredServiceRepairInvocation("/usr/local/bin/tokenmaxxing", "reload-required", "linux", {
+        CODEX_HOME: "/data/Codex Logs, extra",
         PATH: "/usr/local/bin:/usr/bin",
         TOKENMAXXING_CONFIG_DIR: "/tmp/tokenmaxxing",
       }),
@@ -807,6 +1457,7 @@ describe("service repair helpers", () => {
         "--on-active=2s",
         "--unit=tokenmaxxing-sync-repair-reload-required",
         "--setenv=PATH=/usr/local/bin:/usr/bin",
+        "--setenv=CODEX_HOME=/data/Codex Logs, extra",
         "--setenv=TOKENMAXXING_CONFIG_DIR=/tmp/tokenmaxxing",
         "/usr/local/bin/tokenmaxxing",
         "service",
@@ -865,7 +1516,7 @@ describe("service auto-update reports", () => {
       runAutoUpdate(
         metadata,
         {
-          fetchLatestVersion: () => Effect.succeed("0.4.12"),
+          fetchDistTags: () => Effect.succeed({ latest: "0.4.12" }),
           now,
         },
         "0.4.12",
@@ -883,7 +1534,7 @@ describe("service auto-update reports", () => {
     await expect(
       runAutoUpdate({ ...metadata, autoUpdate: false } as ServiceMetadata, {
         commandExists: () => Effect.succeed(false),
-        fetchLatestVersion: () => Effect.succeed("0.4.13"),
+        fetchDistTags: () => Effect.succeed({ latest: "0.4.13" }),
         now,
       }),
     ).resolves.toMatchObject({
@@ -896,7 +1547,7 @@ describe("service auto-update reports", () => {
   it("reports missing service metadata", async () => {
     await expect(
       runAutoUpdate(null, {
-        fetchLatestVersion: () => Effect.succeed("0.4.13"),
+        fetchDistTags: () => Effect.succeed({ latest: "0.4.13" }),
         now,
       }),
     ).resolves.toMatchObject({
@@ -912,7 +1563,7 @@ describe("service auto-update reports", () => {
       runAutoUpdate(
         { ...metadata, autoUpdateManager: null },
         {
-          fetchLatestVersion: () => Effect.succeed("0.4.13"),
+          fetchDistTags: () => Effect.succeed({ latest: "0.4.13" }),
           now,
         },
       ),
@@ -926,7 +1577,7 @@ describe("service auto-update reports", () => {
   it("reports unknown latest version", async () => {
     await expect(
       runAutoUpdate(metadata, {
-        fetchLatestVersion: () => Effect.succeed(null),
+        fetchDistTags: () => Effect.succeed(null),
         now,
       }),
     ).resolves.toMatchObject({
@@ -940,7 +1591,7 @@ describe("service auto-update reports", () => {
     await expect(
       runAutoUpdate(metadata, {
         commandExists: () => Effect.succeed(false),
-        fetchLatestVersion: () => Effect.succeed("0.4.13"),
+        fetchDistTags: () => Effect.succeed({ latest: "0.4.13" }),
         now,
       }),
     ).resolves.toMatchObject({
@@ -954,7 +1605,7 @@ describe("service auto-update reports", () => {
     await expect(
       runAutoUpdate(metadata, {
         commandExists: () => Effect.succeed(true),
-        fetchLatestVersion: () => Effect.succeed("0.4.13"),
+        fetchDistTags: () => Effect.succeed({ latest: "0.4.13" }),
         now,
         runPackageManagerUpdate: () => Effect.fail(new Error("npm failed")),
       }),
@@ -969,7 +1620,7 @@ describe("service auto-update reports", () => {
     await expect(
       runAutoUpdate(metadata, {
         commandExists: () => Effect.succeed(true),
-        fetchLatestVersion: () => Effect.succeed("0.4.13"),
+        fetchDistTags: () => Effect.succeed({ latest: "0.4.13" }),
         now,
         readInstalledVersion: () => Effect.succeed("0.4.12"),
         runPackageManagerUpdate: () => Effect.void,
@@ -985,7 +1636,7 @@ describe("service auto-update reports", () => {
     await expect(
       runAutoUpdate(metadata, {
         commandExists: () => Effect.succeed(true),
-        fetchLatestVersion: () => Effect.succeed("0.4.13"),
+        fetchDistTags: () => Effect.succeed({ latest: "0.4.13" }),
         now,
         readInstalledVersion: () => Effect.succeed("0.4.13"),
         runPackageManagerUpdate: () => Effect.void,
@@ -994,6 +1645,106 @@ describe("service auto-update reports", () => {
       installedVersion: "0.4.13",
       reason: null,
       status: "success",
+    });
+  });
+
+  describe("package-manager release channels", () => {
+    async function runChannelUpdate(currentVersion: string, distTags: Record<string, string>) {
+      const updates: Array<{ manager: string; specifier: string }> = [];
+      const report = await runAutoUpdate(
+        metadata,
+        {
+          commandExists: () => Effect.succeed(true),
+          fetchDistTags: () => Effect.succeed(distTags),
+          now,
+          readInstalledVersion: () =>
+            Effect.succeed(
+              updates.at(-1)?.specifier === "latest"
+                ? distTags.latest!
+                : (updates.at(-1)?.specifier ?? currentVersion),
+            ),
+          runPackageManagerUpdate: (manager, specifier) =>
+            Effect.sync(() => {
+              updates.push({ manager, specifier });
+            }),
+        },
+        currentVersion,
+      );
+
+      return { report, updates };
+    }
+
+    it("never downgrades an alpha runner to an older latest", async () => {
+      const { report, updates } = await runChannelUpdate("0.7.0-alpha.0", {
+        alpha: "0.7.0-alpha.0",
+        latest: "0.6.0",
+      });
+
+      expect(updates).toEqual([]);
+      expect(report).toMatchObject({
+        currentVersion: "0.7.0-alpha.0",
+        installedVersion: "0.7.0-alpha.0",
+        latestVersion: "0.7.0-alpha.0",
+        status: "not-needed",
+      });
+    });
+
+    it("keeps an alpha runner when only an older latest is published", async () => {
+      const { report, updates } = await runChannelUpdate("0.7.0-alpha.0", { latest: "0.6.0" });
+
+      expect(updates).toEqual([]);
+      expect(report).toMatchObject({ latestVersion: "0.6.0", status: "not-needed" });
+    });
+
+    it("updates an alpha runner along the alpha channel by exact version", async () => {
+      const { report, updates } = await runChannelUpdate("0.7.0-alpha.9", {
+        alpha: "0.7.0-alpha.10",
+        latest: "0.6.0",
+      });
+
+      expect(updates).toEqual([{ manager: "npm", specifier: "0.7.0-alpha.10" }]);
+      expect(report).toMatchObject({
+        installedVersion: "0.7.0-alpha.10",
+        latestVersion: "0.7.0-alpha.10",
+        status: "success",
+      });
+    });
+
+    it("graduates an alpha runner to the release on latest", async () => {
+      const { report, updates } = await runChannelUpdate("0.7.0-alpha.1", {
+        alpha: "0.7.0-alpha.1",
+        latest: "0.7.0",
+      });
+
+      expect(updates).toEqual([{ manager: "npm", specifier: "latest" }]);
+      expect(report).toMatchObject({ installedVersion: "0.7.0", status: "success" });
+    });
+
+    it("keeps a stable runner off prerelease channels", async () => {
+      const { report, updates } = await runChannelUpdate("0.6.0", {
+        alpha: "0.7.0-alpha.1",
+        latest: "0.6.0",
+      });
+
+      expect(updates).toEqual([]);
+      expect(report).toMatchObject({ latestVersion: "0.6.0", status: "not-needed" });
+    });
+
+    it("updates a stable runner through latest", async () => {
+      const { report, updates } = await runChannelUpdate("0.6.0", {
+        alpha: "0.7.0-alpha.1",
+        latest: "0.6.1",
+      });
+
+      expect(updates).toEqual([{ manager: "npm", specifier: "latest" }]);
+      expect(report).toMatchObject({ installedVersion: "0.6.1", status: "success" });
+    });
+
+    it("never downgrades a stable runner that is ahead of latest", async () => {
+      const { report, updates } = await runChannelUpdate("0.6.1", { latest: "0.6.0" });
+
+      expect(updates).toEqual([]);
+      expect(report).toMatchObject({ latestVersion: "0.6.0", status: "not-needed" });
     });
   });
 
@@ -1068,7 +1819,9 @@ describe("service auto-update reports", () => {
           reason: null,
           status: "success",
         });
-        expect(fetchedSpecifiers).toEqual([testCase.specifier]);
+        expect(fetchedSpecifiers).toEqual(
+          testCase.specifier === "latest" ? ["latest"] : [testCase.specifier, "latest"],
+        );
       }
     },
   );
@@ -1100,31 +1853,76 @@ describe("service auto-update reports", () => {
     });
   });
 
-  it("does not install a registry runner candidate from a different release channel", async () => {
+  it("never downgrades a prerelease registry runner to an older latest", async () => {
     const paths = servicePaths({
       env: { TOKENMAXXING_CONFIG_DIR: "/tmp/tokenmaxxing" },
       home: "/Users/alex",
       platform: "darwin",
     });
+    const releases: Record<string, string> = { alpha: "0.7.0-alpha.0", latest: "0.6.0" };
 
     await expect(
       runAutoUpdate(
         registryMetadata,
         {
-          fetchRunnerRelease: () => Effect.succeed(registryRelease("0.4.18")),
+          fetchRunnerRelease: (_target, distTag) =>
+            Effect.succeed(registryRelease(releases[distTag]!)),
           installRunnerRelease: () => Effect.fail(new Error("should not install")),
           now,
         },
-        "0.4.18-alpha.1",
+        "0.7.0-alpha.0",
         paths!,
       ),
     ).resolves.toMatchObject({
-      installedVersion: "0.4.18-alpha.1",
-      latestVersion: "0.4.18",
+      installedVersion: "0.7.0-alpha.0",
+      latestVersion: "0.7.0-alpha.0",
       manager: "registry",
       reason: null,
       status: "not-needed",
     });
+  });
+
+  it("graduates a prerelease registry runner once its release lands on latest", async () => {
+    const paths = servicePaths({
+      env: { TOKENMAXXING_CONFIG_DIR: "/tmp/tokenmaxxing" },
+      home: "/Users/alex",
+      platform: "darwin",
+    })!;
+    const releases: Record<string, string | null> = { alpha: "0.4.18-alpha.1", latest: "0.4.18" };
+    const installed: string[] = [];
+
+    await expect(
+      runAutoUpdate(
+        registryMetadata,
+        {
+          fetchRunnerRelease: (_target, distTag) => {
+            const version = releases[distTag];
+            return Effect.succeed(
+              version === null || version === undefined ? null : registryRelease(version),
+            );
+          },
+          installRunnerRelease: (release) =>
+            Effect.sync(() => {
+              installed.push(release.version);
+              return {
+                packageName: release.packageName,
+                path: `/tmp/tokenmaxxing/service-runners/${release.version}/darwin-arm64/tokenmaxxing`,
+                target: release.target,
+                version: release.version,
+              };
+            }),
+          now,
+        },
+        "0.4.18-alpha.1",
+        paths,
+      ),
+    ).resolves.toMatchObject({
+      installedVersion: "0.4.18",
+      latestVersion: "0.4.18",
+      manager: "registry",
+      status: "success",
+    });
+    expect(installed).toEqual(["0.4.18"]);
   });
 
   it("reports registry runner install failures without blocking sync", async () => {
@@ -1208,8 +2006,13 @@ describe("service auto-update reports", () => {
         reason: null,
         status: "success",
       });
-      expect(fetchedTargets).toEqual(["darwin-x64", "darwin-x64-baseline"]);
-      expect(fetchedSpecifiers).toEqual(["alpha", "alpha"]);
+      expect(fetchedTargets).toEqual([
+        "darwin-x64",
+        "darwin-x64",
+        "darwin-x64-baseline",
+        "darwin-x64-baseline",
+      ]);
+      expect(fetchedSpecifiers).toEqual(["alpha", "latest", "alpha", "latest"]);
       expect(installedTargets).toEqual(["darwin-x64-baseline"]);
     } finally {
       await rm(dir, { force: true, recursive: true });
@@ -1588,6 +2391,35 @@ describe("service run state", () => {
         status: "synced",
       },
       { source: "gemini", status: "skipped" },
+    ]);
+  });
+
+  it("logs why a source was skipped and how long each of its reports took", () => {
+    const state = serviceRunSuccessState(
+      { version: 1 },
+      {
+        arch: "arm64",
+        attemptAt: "2026-06-16T10:00:00.000Z",
+        autoUpdate: autoUpdateReport(),
+        durationMs: 1234,
+        result: {
+          ...syncResult,
+          sourceResults: [
+            ...syncResult.sourceResults,
+            { reason: "unchanged", source: "claude", status: "skipped", summary: null },
+          ],
+          timings: { codex: { dailyMs: 95_000, sessionMs: 90_000 }, gemini: { dailyMs: 300 } },
+        },
+        since: "2026-06-16",
+        successAt: "2026-06-16T10:00:01.000Z",
+        version: "0.8.0",
+      },
+    );
+
+    expect(state.lastSources).toEqual([
+      expect.objectContaining({ dailyMs: 95_000, sessionMs: 90_000, source: "codex" }),
+      { dailyMs: 300, source: "gemini", status: "skipped" },
+      { reason: "unchanged", source: "claude", status: "skipped" },
     ]);
   });
 
@@ -2271,10 +3103,38 @@ describe("serviceInstallProgram", () => {
       installedAt: "2026-06-16T12:00:00.000Z",
       runnerTarget: "darwin-arm64",
       runnerVersion: "0.4.17",
-      templateVersion: 5,
+      templateVersion: 6,
     });
     expect(written[0]?.metadata).not.toHaveProperty("autoUpdate");
     expect(state.logs).toContain("Automatic sync installed");
+  });
+
+  it("writes the installing shell's source roots into the service wrapper", async () => {
+    const { layer } = makeTestLayer({
+      initialConfig: {
+        apiUrl: "https://api.tokenmaxxing.example",
+        token: "tmx_existing",
+        wwwUrl: "https://tokenmaxxing.example",
+      },
+    });
+    const { runtime, written } = makeInstallRuntime({
+      env: {
+        CLAUDE_CONFIG_DIR: "/Users/alex/Claude Logs, extra",
+        CODEX_HOME: "/Users/alex/Codex Logs",
+        HERMES_HOME: "",
+      },
+    });
+
+    const exit = await Effect.runPromiseExit(
+      serviceInstallProgram({ force: false, refresh: false }, runtime).pipe(Effect.provide(layer)),
+    );
+
+    expect(exit._tag).toBe("Success");
+    expect(written[0]?.wrapper).toContain(
+      "export CLAUDE_CONFIG_DIR='/Users/alex/Claude Logs, extra'\n",
+    );
+    expect(written[0]?.wrapper).toContain("export CODEX_HOME='/Users/alex/Codex Logs'\n");
+    expect(written[0]?.wrapper).not.toContain("HERMES_HOME");
   });
 
   it("installs the service when the package manager cannot be detected", async () => {
