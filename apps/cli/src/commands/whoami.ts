@@ -4,6 +4,7 @@ import { Command, Flag } from "effect/unstable/cli";
 import { booleanFlag } from "../flags";
 import { ApiClientService, ConfigService } from "../services";
 import { humanFrame, humanSpinner, writeJson } from "../output";
+import { apiFailureMessage, ME_RETRY_POLICY, withApiRetry } from "../api-failure";
 import { isUnauthorizedError } from "../auth-validation";
 
 class NotLoggedInError extends Data.TaggedError("NotLoggedInError")<{}> {
@@ -13,8 +14,13 @@ class NotLoggedInError extends Data.TaggedError("NotLoggedInError")<{}> {
 class WhoamiError extends Data.TaggedError("WhoamiError")<{
   readonly cause: unknown;
 }> {
-  override message =
-    "error: failed to fetch the signed-in user\nhint: run tokenmaxxing login again";
+  override get message() {
+    return apiFailureMessage(
+      "failed to fetch the signed-in user",
+      this.cause,
+      "check your network and try again",
+    );
+  }
 }
 
 const whoamiCommand = Command.make(
@@ -40,8 +46,8 @@ function whoamiEffect(options: { json: boolean }) {
 
       const client = yield* clients.make({ baseUrl: stored.apiUrl, token: stored.token });
       const spinner = yield* humanSpinner("Fetching account", options);
-      const me = yield* client.me.me().pipe(
-        Effect.mapError((cause) =>
+      const me = yield* withApiRetry(() => client.me.me(), ME_RETRY_POLICY).pipe(
+        Effect.mapError(({ cause }) =>
           isUnauthorizedError(cause) ? new NotLoggedInError() : new WhoamiError({ cause }),
         ),
         Effect.tapError(() => Effect.sync(() => spinner.error("Could not fetch account"))),

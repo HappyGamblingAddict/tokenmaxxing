@@ -160,6 +160,29 @@
       ],
       "additionalProperties": false
     },
+    "TooManyRequestsEncoded": {
+      "type": "object",
+      "properties": {
+        "_tag": {
+          "type": "string",
+          "enum": [
+            "TooManyRequests"
+          ]
+        },
+        "message": {
+          "type": "string"
+        },
+        "retryAfterSeconds": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "_tag",
+        "message",
+        "retryAfterSeconds"
+      ],
+      "additionalProperties": false
+    },
     "UnauthorizedEncoded": {
       "type": "object",
       "properties": {
@@ -441,6 +464,16 @@
               }
             }
           },
+          "429": {
+            "description": "TooManyRequests",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TooManyRequestsEncoded"
+                }
+              }
+            }
+          },
           "500": {
             "description": "InternalServerError",
             "content": {
@@ -658,6 +691,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/UnsupportedMediaTypeEncoded"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "TooManyRequests",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TooManyRequestsEncoded"
                 }
               }
             }
@@ -1415,6 +1458,7 @@
                             "copilot",
                             "hermes",
                             "pi",
+                            "omp",
                             "grok",
                             "antigravity",
                             "zcode",
@@ -1460,6 +1504,7 @@
                                 "copilot",
                                 "hermes",
                                 "pi",
+                                "omp",
                                 "grok",
                                 "antigravity",
                                 "zcode",
@@ -1703,6 +1748,7 @@
                                 "copilot",
                                 "hermes",
                                 "pi",
+                                "omp",
                                 "grok",
                                 "antigravity",
                                 "zcode",

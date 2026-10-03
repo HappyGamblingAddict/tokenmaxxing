@@ -1,8 +1,17 @@
-import { Cause, Effect, Layer, Option } from "effect";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import { Cause, Effect, Fiber, Layer, Option } from "effect";
+import * as HttpClientError from "effect/unstable/http/HttpClientError";
+import * as HttpClientRequest from "effect/unstable/http/HttpClientRequest";
+import { TestClock } from "effect/testing";
 import { Unauthorized, UserId, type AuthUser } from "@tokenmaxxing/api-contract";
 import { describe, expect, it } from "vite-plus/test";
 
-import { CcusageRunError } from "../ccusage/runner";
+import { ccusageDailyFixture } from "../../../api/src/testing/ccusage-fixtures";
+import { SCHEDULED_ME_RETRY_POLICY } from "../api-failure";
+import { CcusageRunError, stderrTail } from "../ccusage/runner";
 import {
   ApiClientService,
   BrowserService,
@@ -17,7 +26,9 @@ import {
 import { formatUrl } from "../output";
 import { makeStubApiClient, type StubResponse } from "../testing/stub-api-client";
 import { browserLoginEffect, NonInteractiveLoginError } from "./login";
+import { NotLoggedInError } from "./whoami";
 import {
+  describeSyncSourcesFailure,
   formatSyncUsd,
   InvalidSinceError,
   openProfileIfAvailable,
@@ -30,6 +41,9 @@ import {
   syncStatusForSources,
   SyncAuthValidationError,
   SyncPushError,
+  SyncSourcesFailedError,
+  sourcesWithoutLogs,
+  syncSourceIssue,
   type SyncAuth,
   type SyncSourceIssue,
   uploadUsageReports,
@@ -71,7 +85,7 @@ const invalidSessionIssue: SyncSourceIssue = {
 };
 
 function ccusageFailure(
-  code: "command_failed" | "invalid_report",
+  code: "command_failed" | "command_timed_out" | "invalid_report",
   report: "daily" | "session",
   source: string,
 ) {
@@ -123,7 +137,9 @@ function makeTestLayer(options: TestLayerOptions) {
             me: () =>
               options.meError === undefined
                 ? Effect.succeed({ user })
-                : Effect.fail(options.meError),
+                : options.meError === "never"
+                  ? Effect.never
+                  : Effect.fail(options.meError),
           },
           usage: {
             ingest: () =>
@@ -487,6 +503,156 @@ describe("sync source outcomes", () => {
     ]);
   });
 
+  describe("source limits", () => {
+    const { layer } = makeTestLayer({
+      initialConfig: {
+        apiUrl: "https://api.tokenmaxxing.example",
+        wwwUrl: "https://tokenmaxxing.example",
+      },
+      interactive: false,
+    });
+    const day = { daily: [{ date: "2026-07-22", totalTokens: 10 }] };
+
+    it("skips the remaining sources after a ccusage timeout", async () => {
+      const ran: string[] = [];
+      const result = await Effect.runPromise(
+        syncProgram(
+          {
+            dryRun: true,
+            json: true,
+            sourceLimits: { stopAfterTimeout: true },
+            sourcePlans: { gemini: { mode: "skip", reason: "unchanged" } },
+            sources: "claude,codex,opencode,gemini,pi",
+          },
+          {
+            runDailyReport: (source) =>
+              Effect.suspend(() => {
+                ran.push(source.source);
+                return source.source === "codex"
+                  ? Effect.fail(ccusageFailure("command_timed_out", "daily", source.source))
+                  : Effect.succeed(day);
+              }),
+            runSessionReport: () => Effect.succeed({ sessions: [] }),
+          },
+        ).pipe(Effect.provide(layer)),
+      );
+
+      expect(ran).toEqual(["claude", "codex"]);
+      expect(result.status).toBe("partial");
+      expect(
+        result.sourceResults.map((r) => [r.source, r.status, "reason" in r ? r.reason : null]),
+      ).toEqual([
+        ["claude", "synced", null],
+        ["codex", "failed", null],
+        ["opencode", "skipped", "runner_timed_out"],
+        // A plan's own skip keeps its reason.
+        ["gemini", "skipped", "unchanged"],
+        ["pi", "skipped", "runner_timed_out"],
+      ]);
+      expect(result.timings?.opencode).toBeUndefined();
+    });
+
+    it("also stops after a session report times out", async () => {
+      const ran: string[] = [];
+      const result = await Effect.runPromise(
+        syncProgram(
+          {
+            dryRun: true,
+            json: true,
+            sourceLimits: { stopAfterTimeout: true },
+            sources: "claude,codex",
+          },
+          {
+            runDailyReport: (source) =>
+              Effect.sync(() => {
+                ran.push(source.source);
+                return day;
+              }),
+            runSessionReport: (source) =>
+              Effect.fail(ccusageFailure("command_timed_out", "session", source.source)),
+          },
+        ).pipe(Effect.provide(layer)),
+      );
+
+      expect(ran).toEqual(["claude"]);
+      expect(result.sourceResults.map(({ source, status }) => [source, status])).toEqual([
+        ["claude", "partial"],
+        ["codex", "skipped"],
+      ]);
+    });
+
+    it("keeps going after a timeout without the limit (foreground sync)", async () => {
+      const result = await Effect.runPromise(
+        syncProgram(
+          { dryRun: true, json: true, sources: "claude,codex" },
+          {
+            runDailyReport: (source) =>
+              source.source === "claude"
+                ? Effect.fail(ccusageFailure("command_timed_out", "daily", source.source))
+                : Effect.succeed(day),
+            runSessionReport: () => Effect.succeed({ sessions: [] }),
+          },
+        ).pipe(Effect.provide(layer)),
+      );
+
+      expect(result.sourceResults.map(({ source, status }) => [source, status])).toEqual([
+        ["claude", "failed"],
+        ["codex", "synced"],
+      ]);
+    });
+
+    it("starts no source after the run's deadline", async () => {
+      let now = 1_000;
+      const ran: string[] = [];
+      const result = await Effect.runPromise(
+        syncProgram(
+          {
+            dryRun: true,
+            json: true,
+            sourceLimits: { deadlineAt: 5_000 },
+            sources: "claude,codex,opencode",
+          },
+          {
+            now: () => now,
+            runDailyReport: (source) =>
+              Effect.sync(() => {
+                ran.push(source.source);
+                now += 4_000;
+                return day;
+              }),
+            runSessionReport: () => Effect.succeed({ sessions: [] }),
+          },
+        ).pipe(Effect.provide(layer)),
+      );
+
+      expect(ran).toEqual(["claude"]);
+      expect(result.status).toBe("ok");
+      expect(result.sourceResults.slice(1)).toEqual([
+        { reason: "run_deadline", source: "codex", status: "skipped", summary: null },
+        { reason: "run_deadline", source: "opencode", status: "skipped", summary: null },
+      ]);
+    });
+
+    it("renders the limits' skip reasons", () => {
+      expect(
+        renderSyncSourceResult({
+          reason: "runner_timed_out",
+          source: "codex",
+          status: "skipped",
+          summary: null,
+        }),
+      ).toBe("codex skipped (stopped after a ccusage timeout)");
+      expect(
+        renderSyncSourceResult({
+          reason: "run_deadline",
+          source: "codex",
+          status: "skipped",
+          summary: null,
+        }),
+      ).toBe("codex skipped (run time limit reached)");
+    });
+  });
+
   it("uploads daily reports plus aggregate session counts without session payloads", async () => {
     const { layer } = makeTestLayer({
       initialConfig: {
@@ -761,6 +927,94 @@ describe("sync source outcomes", () => {
     },
   );
 
+  it("syncs Oh My Pi as its own source through the pi subcommand", async () => {
+    const { layer } = makeTestLayer({
+      initialConfig: {
+        apiUrl: "https://api.tokenmaxxing.example",
+        wwwUrl: "https://tokenmaxxing.example",
+      },
+      interactive: false,
+    });
+    let uploadPayload: TestUsageIngestRequest["payload"] | undefined;
+    const auth = makeUploadAuth((request) =>
+      Effect.sync(() => {
+        uploadPayload = request.payload;
+        return { received: 1, syncedAt: "2026-09-12T00:00:00.000Z", upserted: 1 };
+      }),
+    );
+    const ompReport = ccusageDailyFixture("omp");
+    const piReport = {
+      daily: [
+        {
+          date: "2026-09-10",
+          modelBreakdowns: [
+            {
+              cacheCreationTokens: 0,
+              cacheReadTokens: 0,
+              cost: 0.5,
+              inputTokens: 77_777,
+              modelName: "[pi] gemini-3.1-pro",
+              outputTokens: 1_111,
+            },
+          ],
+          totalCost: 0.5,
+          totalTokens: 78_888,
+        },
+      ],
+    };
+    const runs: Array<{ source: string; subcommand: string }> = [];
+
+    const result = await Effect.runPromise(
+      syncProgram(
+        { auth, dryRun: false, json: true, sources: "pi,omp" },
+        {
+          runDailyReport: (source) =>
+            Effect.sync(() => {
+              runs.push({ source: source.source, subcommand: source.subcommand });
+              return source.source === "omp" ? ompReport : piReport;
+            }),
+          runSessionReport: (source) =>
+            Effect.succeed({ sessions: source.source === "omp" ? [{}, {}, {}] : [{}] }),
+        },
+      ).pipe(Effect.provide(layer)),
+    );
+
+    expect(runs).toEqual([
+      { source: "pi", subcommand: "pi" },
+      { source: "omp", subcommand: "pi" },
+    ]);
+    expect(result.sourceResults).toEqual([
+      {
+        source: "pi",
+        status: "synced",
+        summary: { days: 1, models: 1, rows: 1, sessions: 1, spendUsd: 0.5 },
+      },
+      {
+        source: "omp",
+        status: "synced",
+        summary: { days: 2, models: 3, rows: 4, sessions: 3, spendUsd: expect.closeTo(0.1123, 10) },
+      },
+    ]);
+    // OMP's session paths stay out of the uploaded command.
+    const command = [
+      "ccusage@^20.0.22",
+      "pi",
+      "daily",
+      "--json",
+      "--breakdown",
+      "--mode",
+      "calculate",
+    ];
+    expect(uploadPayload?.reports).toMatchObject([
+      { command, source: "pi" },
+      { command, payload: ompReport, source: "omp" },
+    ]);
+    expect(uploadPayload?.sourceStats).toEqual([
+      { sessionCount: 1, source: "pi" },
+      { sessionCount: 3, source: "omp" },
+    ]);
+  });
+
   it("treats a valid empty daily report as no data", async () => {
     const { layer } = makeTestLayer({
       initialConfig: {
@@ -854,6 +1108,64 @@ describe("uploadUsageReports", () => {
     expect(state.sleeps).toEqual([]);
   });
 
+  // FAIL-4: a server that accepted the connection and never answered left a
+  // foreground sync on "Uploading usage" forever.
+  it("times out a foreground upload the server never answers", async () => {
+    const { layer, state } = makeConsoleLayer();
+    const auth = makeUploadAuth(() => Effect.never);
+
+    const exit = await Effect.runPromise(
+      Effect.gen(function* () {
+        const fiber = yield* Effect.forkChild(
+          Effect.exit(
+            uploadUsageReports({
+              auth,
+              device: { name: "Mac.local", platform: "darwin" },
+              options: { json: false },
+              rawReports: [],
+            }),
+          ),
+        );
+        yield* TestClock.adjust("60 seconds");
+        return yield* Fiber.join(fiber);
+      }).pipe(Effect.provide(Layer.merge(layer, TestClock.layer()))),
+    );
+
+    const error = exit._tag === "Failure" ? Cause.findErrorOption(exit.cause) : Option.none();
+    expect(Option.getOrUndefined(error)).toBeInstanceOf(SyncPushError);
+    expect((Option.getOrUndefined(error) as SyncPushError).message).toBe(
+      "error: failed to push usage to tokenmaxxing; the tokenmaxxing API did not answer within 60 s\nhint: check your network, then try again",
+    );
+    expect(state.errors).toEqual(["Failed uploading usage"]);
+  });
+
+  it("says when to retry a rate-limited upload", async () => {
+    const { layer } = makeConsoleLayer();
+    const client = await Effect.runPromise(
+      makeStubApiClient({
+        "POST /usage/ingest": {
+          body: { _tag: "RateLimited", message: "slow down" },
+          headers: { "retry-after": "60" },
+          status: 429,
+        },
+      }),
+    );
+
+    const exit = await Effect.runPromiseExit(
+      uploadUsageReports({
+        auth: { ...makeUploadAuth(() => Effect.never), client },
+        device: { name: "Mac.local", platform: "darwin" },
+        options: { json: false },
+        rawReports: [],
+      }).pipe(Effect.provide(layer)),
+    );
+
+    const error = exit._tag === "Failure" ? Cause.findErrorOption(exit.cause) : Option.none();
+    expect((Option.getOrUndefined(error) as SyncPushError).message).toBe(
+      "error: failed to push usage to tokenmaxxing; the tokenmaxxing API is rate limiting requests\nhint: try again in 60 s",
+    );
+  });
+
   it("retries uploads when an upload policy is provided", async () => {
     const { layer, state } = makeConsoleLayer();
     let calls = 0;
@@ -892,6 +1204,53 @@ describe("uploadUsageReports", () => {
     expect(state.errors).toEqual([]);
   });
 
+  describe("scheduled retries after a 429", () => {
+    const policy = { attempts: 3, backoffMs: [1_000, 4_000], jitterRatio: 0, timeoutMs: 1_000 };
+    const rateLimited = (retryAfter: string) => ({
+      body: { _tag: "RateLimited", message: "slow down" },
+      headers: { "retry-after": retryAfter },
+      status: 429,
+    });
+    const accepted = {
+      body: { received: 1, syncedAt: "2026-06-15T00:00:00.000Z", upserted: 3 },
+      status: 200,
+    };
+
+    async function upload(responses: Parameters<typeof makeStubApiClient>[0]) {
+      const { layer, state } = makeConsoleLayer();
+      const requests: string[] = [];
+      const client = await Effect.runPromise(makeStubApiClient(responses, requests));
+      const exit = await Effect.runPromiseExit(
+        uploadUsageReports({
+          auth: { ...makeUploadAuth(() => Effect.never), client },
+          device: { name: "Mac.local", platform: "darwin" },
+          options: { json: true },
+          rawReports: [],
+          uploadPolicy: policy,
+        }).pipe(Effect.provide(layer)),
+      );
+      return { exit, requests, sleeps: state.sleeps };
+    }
+
+    it("waits the Retry-After instead of the shorter backoff", async () => {
+      const result = await upload({
+        "POST /usage/ingest": [rateLimited("30"), accepted],
+      });
+
+      expect(result.exit._tag).toBe("Success");
+      expect(result.sleeps).toEqual([30_000]);
+      expect(result.requests).toHaveLength(2);
+    });
+
+    it("stops retrying when the Retry-After is longer than a run should wait", async () => {
+      const result = await upload({ "POST /usage/ingest": rateLimited("3600") });
+
+      expect(result.exit._tag).toBe("Failure");
+      expect(result.sleeps).toEqual([]);
+      expect(result.requests).toHaveLength(1);
+    });
+  });
+
   it("does not write upload progress for json or silent output", async () => {
     const { layer, state } = makeConsoleLayer();
     const auth = makeUploadAuth(() =>
@@ -921,6 +1280,189 @@ describe("uploadUsageReports", () => {
 
     expect(state.logs).toEqual([]);
     expect(state.errors).toEqual([]);
+  });
+});
+
+describe("SyncSourcesFailedError", () => {
+  const issue = (code: SyncSourceIssue["code"], message: string): SyncSourceIssue => ({
+    code,
+    message,
+    report: "daily",
+  });
+
+  it("names the missing runner when neither bun nor npx exists", () => {
+    const notFound = issue("command_not_found", "ccusage command not found");
+    const failures = [
+      { issue: notFound, source: "claude" as const },
+      { issue: notFound, source: "codex" as const },
+    ];
+
+    expect(new SyncSourcesFailedError({ failures, platform: "linux" }).message).toBe(
+      "error: no usage synced; could not run ccusage for claude, codex: neither bun nor npx is on PATH\nhint: install Bun (https://bun.sh) or Node.js (https://nodejs.org), then run tokenmaxxing sync again",
+    );
+    // Windows runs npm's npx.cmd shim.
+    expect(
+      describeSyncSourcesFailure({ failures, platform: "win32", withoutLogs: ["codex"] }).lines,
+    ).toEqual([
+      "no usage synced; could not run ccusage for claude and 1 agent without logs: neither bun nor npx.cmd is on PATH",
+    ]);
+    // Next to other reasons, it still says what was missing.
+    expect(
+      describeSyncSourcesFailure({
+        failures: [
+          { issue: notFound, source: "claude" },
+          { issue: issue("command_failed", "ccusage command failed"), source: "codex" },
+        ],
+        platform: "win32",
+      }).lines,
+    ).toEqual([
+      "no usage synced; ccusage failed for claude, codex",
+      "claude: ccusage command not found (neither bun nor npx.cmd is on PATH)",
+      "codex: ccusage command failed",
+    ]);
+  });
+
+  it("lists each distinct reason with the sources it hit", () => {
+    expect(
+      new SyncSourcesFailedError({
+        failures: [
+          { issue: issue("command_timed_out", "ccusage command timed out"), source: "claude" },
+          { issue: issue("command_failed", "ccusage command failed"), source: "codex" },
+          { issue: issue("command_timed_out", "ccusage command timed out"), source: "gemini" },
+        ],
+      }).message,
+    ).toBe(
+      [
+        "error: no usage synced; ccusage failed for claude, codex, gemini",
+        "claude, gemini: ccusage command timed out",
+        "codex: ccusage command failed",
+        "hint: check that ccusage runs for these agents, then run tokenmaxxing sync again",
+      ].join("\n"),
+    );
+  });
+
+  // A broken ccusage (node missing) fails all 18 agents; naming them all
+  // buried the two that have usage.
+  it("names only the agents with logs and counts the rest", () => {
+    const failed = issue("command_failed", "ccusage command failed");
+    const failures = (["claude", "codex", "gemini", "amp"] as const).map((source) => ({
+      issue: { ...failed, detail: "sh: exec: node: not found" },
+      source,
+    }));
+
+    expect(new SyncSourcesFailedError({ failures, withoutLogs: ["gemini", "amp"] }).message).toBe(
+      [
+        "error: no usage synced; ccusage failed for claude, codex and 2 agents without logs",
+        "claude, codex and 2 agents without logs: ccusage command failed: sh: exec: node: not found",
+        "hint: check that ccusage runs for these agents, then run tokenmaxxing sync again",
+      ].join("\n"),
+    );
+    expect(
+      new SyncSourcesFailedError({ failures: failures.slice(2), withoutLogs: ["gemini", "amp"] })
+        .message,
+    ).toContain("error: no usage synced; ccusage failed for 2 agents without logs\n");
+    expect(
+      new SyncSourcesFailedError({ failures: failures.slice(0, 3), withoutLogs: ["gemini"] })
+        .message,
+    ).toContain("ccusage failed for claude, codex and 1 agent without logs\n");
+  });
+
+  // 0.7.5 reported stderr's last line: an installed version after asdf's message, and the
+  // middle of dyld's `Reason: tried: …` instead of the library it could not load.
+  it("reports the stderr line that says why, not the last one", () => {
+    const failed = (source: "claude" | "codex", stderr: string) => ({
+      issue: syncSourceIssue(
+        new CcusageRunError({
+          cause: Object.assign(new Error("bun exited with code 126"), { code: 126, signal: null }),
+          code: "command_failed",
+          report: "daily",
+          runner: "bun",
+          source,
+          stderr: stderrTail(stderr),
+        }),
+      ),
+      source,
+    });
+
+    expect(
+      describeSyncSourcesFailure({
+        failures: [
+          failed(
+            "claude",
+            "No preset version installed for command node\nPlease install a version by running one of the following:\n\nasdf install nodejs 22.21.0\n\nor add one of the following versions in your config file at /Users/alex/.tool-versions\nnodejs 26.3.0",
+          ),
+          failed(
+            "codex",
+            `dyld[48213]: Library not loaded: /usr/local/opt/simdutf/lib/libsimdutf.26.dylib\n  Referenced from: <6B4A2D1E> /usr/local/Cellar/node/24.9.0/bin/node\n  Reason: tried: ${"'/usr/local/opt/simdutf/lib/libsimdutf.26.dylib' (no such file), ".repeat(8)}`,
+          ),
+        ],
+      }).lines,
+    ).toEqual([
+      "no usage synced; ccusage failed for claude, codex",
+      "claude: ccusage command failed: No preset version installed for command node",
+      "codex: ccusage command failed: dyld[48213]: Library not loaded: /usr/local/opt/simdutf/lib/libsimdutf.26.dylib",
+    ]);
+  });
+
+  // 0.7.3 on Windows with only npm's bun.cmd: Bun refused to start it, nothing reached stderr,
+  // and prod saw a bare "ccusage command failed" for every agent.
+  it("says which runner failed and how when ccusage printed nothing", () => {
+    const startFailure = (runner: string, startError: string) =>
+      new CcusageRunError({
+        cause: Object.assign(new Error("spawn failed"), { code: startError }),
+        code: "command_failed",
+        report: "daily",
+        runner,
+        source: "claude",
+        startError,
+      });
+    const npxExit = (stderr?: string) =>
+      new CcusageRunError({
+        cause: Object.assign(new Error("npx.cmd exited with code 1"), { code: 1, signal: null }),
+        code: "command_failed",
+        earlier: ["bun.cmd could not be started (EINVAL)"],
+        report: "daily",
+        runner: "npx.cmd",
+        source: "codex",
+        stderr,
+      });
+
+    expect(syncSourceIssue(startFailure("bun.cmd", "ERR_INVALID_ARG_VALUE"))).toEqual({
+      code: "command_failed",
+      detail: "bun.cmd could not be started (ERR_INVALID_ARG_VALUE)",
+      message: "ccusage command failed",
+      report: "daily",
+    });
+    expect(
+      describeSyncSourcesFailure({
+        failures: [
+          { issue: syncSourceIssue(startFailure("bun.exe", "EACCES")), source: "claude" },
+          { issue: syncSourceIssue(npxExit()), source: "codex" },
+        ],
+      }).lines,
+    ).toEqual([
+      "no usage synced; ccusage failed for claude, codex",
+      "claude: ccusage command failed: bun.exe could not be started (EACCES)",
+      "codex: ccusage command failed: npx.cmd exited with code 1; tried first: bun.cmd could not be started (EINVAL)",
+    ]);
+    // stderr, when there is any, still says it best.
+    expect(syncSourceIssue(npxExit("npm error code E404")).detail).toBe("npm error code E404");
+  });
+
+  it("tells agents with logs from those without", async () => {
+    const home = await mkdtemp(join(tmpdir(), "tokenmaxxing-without-logs-"));
+    try {
+      await mkdir(join(home, ".claude", "projects", "app"), { recursive: true });
+      await writeFile(join(home, ".claude", "projects", "app", "session.jsonl"), "{}\n");
+
+      await expect(
+        Effect.runPromise(
+          sourcesWithoutLogs(["claude", "codex", "gemini"], { cwd: home, env: {}, home }),
+        ),
+      ).resolves.toEqual(["codex", "gemini"]);
+    } finally {
+      await rm(home, { force: true, recursive: true });
+    }
   });
 });
 
@@ -1250,6 +1792,147 @@ describe("resolveSyncAuth token clearing", () => {
     expect(state.browserUrls).toEqual([]);
     const error = exit._tag === "Failure" ? Cause.findErrorOption(exit.cause) : Option.none();
     expect(Option.getOrUndefined(error)).toBeInstanceOf(SyncAuthValidationError);
+  });
+
+  it.each<[string, StubResponse, number]>([
+    ["an empty 500", { status: 500 }, 500],
+    ["an HTML 502", { body: "<html>Bad gateway</html>", status: 502 }, 502],
+    [
+      "a typed 503",
+      { body: { _tag: "ServiceUnavailable", message: "Temporarily unavailable" }, status: 503 },
+      503,
+    ],
+  ])("says a /me server error is not the network (%s)", async (_label, response, status) => {
+    const requests: string[] = [];
+    const { layer } = makeTestLayer({
+      client: makeStubApiClient({ "GET /me": response }, requests),
+      initialConfig: storedConfig,
+    });
+
+    const exit = await Effect.runPromiseExit(
+      resolveSyncAuth({ json: false }).pipe(Effect.provide(layer)),
+    );
+
+    // Interactive: one quick retry.
+    expect(requests).toEqual(["GET /me", "GET /me"]);
+    const error = exit._tag === "Failure" ? Cause.findErrorOption(exit.cause) : Option.none();
+    expect(Option.getOrUndefined(error)?.message).toBe(
+      `error: failed to validate stored login after 2 attempts; the tokenmaxxing API had a server error (HTTP ${status})\nhint: the problem is on the tokenmaxxing side; try again later`,
+    );
+  });
+
+  it("says when to retry, not to log in again, when /me is rate limited", async () => {
+    const { layer, state } = makeTestLayer({
+      client: makeStubApiClient({
+        "GET /me": {
+          body: { _tag: "RateLimited", message: "slow down" },
+          headers: { "retry-after": "60" },
+          status: 429,
+        },
+      }),
+      initialConfig: storedConfig,
+    });
+
+    const exit = await Effect.runPromiseExit(
+      resolveSyncAuth({ json: false }).pipe(Effect.provide(layer)),
+    );
+
+    expect(state.clearedTokens).toBe(0);
+    const error = exit._tag === "Failure" ? Cause.findErrorOption(exit.cause) : Option.none();
+    expect(Option.getOrUndefined(error)).toBeInstanceOf(SyncAuthValidationError);
+    expect((Option.getOrUndefined(error) as SyncAuthValidationError).message).toBe(
+      "error: failed to validate stored login; the tokenmaxxing API is rate limiting requests\nhint: try again in 60 s",
+    );
+  });
+
+  it("times out a /me call the server never answers", async () => {
+    const { layer, state } = makeTestLayer({ initialConfig: storedConfig, meError: "never" });
+
+    const exit = await Effect.runPromise(
+      Effect.gen(function* () {
+        const fiber = yield* Effect.forkChild(Effect.exit(resolveSyncAuth({ json: false })));
+        yield* TestClock.adjust("15 seconds");
+        return yield* Fiber.join(fiber);
+      }).pipe(Effect.provide(Layer.merge(layer, TestClock.layer()))),
+    );
+
+    expect(state.clearedTokens).toBe(0);
+    const error = exit._tag === "Failure" ? Cause.findErrorOption(exit.cause) : Option.none();
+    expect((Option.getOrUndefined(error) as SyncAuthValidationError).message).toBe(
+      "error: failed to validate stored login; the tokenmaxxing API did not answer within 15 s\nhint: check your network, then try again",
+    );
+  });
+
+  it("retries a scheduled /me on transient failures until it answers", async () => {
+    const requests: string[] = [];
+    const { layer } = makeTestLayer({
+      client: makeStubApiClient(
+        {
+          "GET /me": [
+            { status: 502 },
+            { body: { _tag: "ServiceUnavailable", message: "later" }, status: 503 },
+            { body: { user }, status: 200 },
+          ],
+        },
+        requests,
+      ),
+      initialConfig: storedConfig,
+    });
+
+    const auth = await Effect.runPromise(
+      resolveSyncAuth({ json: true, loginCheckRetry: SCHEDULED_ME_RETRY_POLICY }).pipe(
+        Effect.provide(layer),
+      ),
+    );
+
+    expect(auth.user.login).toBe("alex");
+    expect(requests).toEqual(["GET /me", "GET /me", "GET /me"]);
+  });
+
+  it("never retries a decoded Unauthorized, even on a scheduled run", async () => {
+    const requests: string[] = [];
+    const { layer, state } = makeTestLayer({
+      client: makeStubApiClient({ "GET /me": { body: unauthorizedBody, status: 401 } }, requests),
+      initialConfig: storedConfig,
+    });
+
+    const exit = await Effect.runPromiseExit(
+      resolveSyncAuth({ json: true, loginCheckRetry: SCHEDULED_ME_RETRY_POLICY }).pipe(
+        Effect.provide(layer),
+      ),
+    );
+
+    expect(requests).toEqual(["GET /me"]);
+    expect(state.clearedTokens).toBe(0);
+    const error = exit._tag === "Failure" ? Cause.findErrorOption(exit.cause) : Option.none();
+    expect(Option.getOrUndefined(error)).toBeInstanceOf(NotLoggedInError);
+  });
+
+  it("says what a failed login check ran into, in the message and in --json", async () => {
+    const request = HttpClientRequest.get("https://api.tokenmaxxing.example/me");
+    const offline = new HttpClientError.HttpClientError({
+      reason: new HttpClientError.TransportError({
+        cause: Object.assign(new TypeError("getaddrinfo ENOTFOUND"), { code: "ENOTFOUND" }),
+        request,
+      }),
+    });
+    const { layer } = makeTestLayer({ initialConfig: storedConfig, meError: offline });
+
+    const exit = await Effect.runPromiseExit(
+      resolveSyncAuth({ json: true, loginCheckRetry: SCHEDULED_ME_RETRY_POLICY }).pipe(
+        Effect.provide(layer),
+      ),
+    );
+
+    const error = exit._tag === "Failure" ? Cause.findErrorOption(exit.cause) : Option.none();
+    const failure = Option.getOrUndefined(error) as SyncAuthValidationError;
+    expect(failure).toBeInstanceOf(SyncAuthValidationError);
+    expect(failure.message).toBe(
+      "error: failed to validate stored login after 3 attempts; network unavailable (ENOTFOUND)\nhint: check your network and run tokenmaxxing sync again",
+    );
+    expect(failure.jsonFields).toEqual({
+      loginCheck: { attempts: 3, code: "ENOTFOUND", kind: "network" },
+    });
   });
 
   it("keeps the stored token for an error that only looks like Unauthorized", async () => {

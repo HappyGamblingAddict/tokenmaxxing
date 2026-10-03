@@ -82,6 +82,7 @@ Sync is idempotent and profiles aggregate across devices, so you can run
 - GitHub Copilot CLI
 - Hermes
 - Pi
+- Oh My Pi
 - Grok Build CLI
 - Antigravity
 - ZCode
@@ -99,6 +100,12 @@ environment variables ccusage reads (for example `CODEX_HOME`, `GROK_HOME`, or
 `AMP_DATA_DIR`; see ccusage's
 [environment variables](https://ccusage.com/guide/environment-variables)).
 
+Oh My Pi is read with ccusage's Pi parser, pointed at OMP's own sessions:
+`~/.omp/agent/sessions` and every named profile under `~/.omp/profiles/`,
+following `PI_CONFIG_DIR` and an existing `$XDG_DATA_HOME/omp` like OMP does.
+Pi and Oh My Pi never count each other's sessions: OMP ignores `PI_AGENT_DIR`,
+and Pi skips any `PI_AGENT_DIR` entry that points at OMP's sessions.
+
 ## Usage
 
 ```bash
@@ -109,7 +116,7 @@ tokenmaxxing sync --sources claude,codex  # Only sync selected agents
 
 tokenmaxxing service install              # Sync automatically every 5 minutes
 tokenmaxxing service status               # Show service health and the last run
-tokenmaxxing service doctor               # Inspect auth, scheduler, locks, and logs
+tokenmaxxing service doctor               # Check auth, scheduler, locks, and logs (exit 1 on a problem)
 
 tokenmaxxing whoami                        # Show the signed-in account
 tokenmaxxing upgrade                       # Upgrade the CLI and refresh the service
@@ -125,10 +132,12 @@ The background service supports macOS, Linux, and Windows. It uses the global
 `tokenmaxxing` binary and keeps itself current through the package manager that
 installed the CLI when that package manager can be detected.
 
-Custom agent log roots (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `HERMES_HOME`,
-`GROK_HOME`, `ANTIGRAVITY_DATA_DIR`, `ZCODE_HOME`, `AMP_DATA_DIR`,
-`QWEN_DATA_DIR`, `KIMI_DATA_DIR`, `KILO_DATA_DIR`, `GOOSE_PATH_ROOT`,
-`DROID_SESSIONS_DIR`, `CODEBUFF_DATA_DIR`, `OPENCLAW_DIR`) are captured from
+Custom agent log roots (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `OPENCODE_DATA_DIR`,
+`GEMINI_DATA_DIR`, `COPILOT_HOME`, `COPILOT_OTEL_FILE_EXPORTER_PATH`,
+`HERMES_HOME`, `PI_AGENT_DIR`, `GROK_HOME`, `ANTIGRAVITY_DATA_DIR`, `ZCODE_HOME`,
+`AMP_DATA_DIR`, `QWEN_DATA_DIR`, `KIMI_DATA_DIR`, `KILO_DATA_DIR`,
+`GOOSE_PATH_ROOT`, `DROID_SESSIONS_DIR`, `CODEBUFF_DATA_DIR`, `OPENCLAW_DIR`,
+`PI_CONFIG_DIR`, `XDG_DATA_HOME`, `XDG_CONFIG_HOME`) are captured from
 your shell when you run `tokenmaxxing service install` or
 `tokenmaxxing service repair`; rerun one of those after changing them, and
 `tokenmaxxing service doctor` warns when they drift. Without `HERMES_HOME`, both

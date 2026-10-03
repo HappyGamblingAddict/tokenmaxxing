@@ -1,4 +1,4 @@
-import { execFile, execFileSync } from "node:child_process";
+import { execFile, execFileSync, spawn } from "node:child_process";
 import {
   chmodSync,
   existsSync,
@@ -9,7 +9,7 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { hostname, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 import { afterAll, describe, expect, it } from "vite-plus/test";
@@ -34,6 +34,11 @@ const FAKE_CCUSAGE = `#!/bin/sh
 echo "$*" >> "$FAKE_CALLS_LOG"
 source="$3"
 report="$4"
+if [ "$FAKE_CCUSAGE" = slow ]; then
+  # Like bun x running ccusage's node bin: exec in place, so this pid is ccusage.
+  echo $$ > "$FAKE_CALLS_LOG.pid"
+  exec sleep 30
+fi
 if [ "$FAKE_CCUSAGE" = fail ] || { [ "$FAKE_CCUSAGE" = partial ] && [ "$source" = codex ]; }; then
   echo "fake ccusage failure" >&2
   exit 1
@@ -99,13 +104,21 @@ function makeSandbox() {
 const bun = process.platform === "win32" ? "" : bunPath();
 
 interface RunCliOptions {
-  ccusage?: "empty" | "fail" | "partial";
+  /** "missing": no bun or npx on PATH at all. "slow": ccusage runs for 30 s. */
+  ccusage?: "empty" | "fail" | "missing" | "partial" | "slow";
   env?: Record<string, string>;
   serviceState?: Record<string, unknown>;
+  /** Runs against the sandbox root before the CLI starts. */
+  setup?: (root: string) => void;
 }
 
 function runCli(args: readonly string[], options: RunCliOptions = {}) {
   const root = makeSandbox();
+  options.setup?.(root);
+  if (options.ccusage === "missing") {
+    rmSync(join(root, "bin", "bun"));
+    rmSync(join(root, "bin", "npx"));
+  }
   const configDir = join(root, "config");
   const callsLog = join(root, "calls.log");
   if (options.serviceState !== undefined) {
@@ -119,18 +132,7 @@ function runCli(args: readonly string[], options: RunCliOptions = {}) {
       {
         cwd: cliRoot,
         encoding: "utf8",
-        env: {
-          CI: "true",
-          FAKE_CALLS_LOG: callsLog,
-          FAKE_CCUSAGE: options.ccusage ?? "empty",
-          HOME: join(root, "home"),
-          NO_COLOR: "1",
-          PATH: `${join(root, "bin")}:/usr/bin:/bin`,
-          TOKENMAXXING_API_URL: "http://127.0.0.1:9",
-          TOKENMAXXING_CONFIG_DIR: configDir,
-          TOKENMAXXING_WWW_URL: "http://127.0.0.1:9",
-          ...options.env,
-        },
+        env: cliEnv(root, options),
         timeout: 30_000,
       },
       (error, stdout, stderr) => {
@@ -144,6 +146,74 @@ function runCli(args: readonly string[], options: RunCliOptions = {}) {
       },
     );
   });
+}
+
+function cliEnv(root: string, options: RunCliOptions): Record<string, string> {
+  return {
+    CI: "true",
+    FAKE_CALLS_LOG: join(root, "calls.log"),
+    FAKE_CCUSAGE: options.ccusage ?? "empty",
+    HOME: join(root, "home"),
+    NO_COLOR: "1",
+    PATH: `${join(root, "bin")}:/usr/bin:/bin`,
+    TOKENMAXXING_API_URL: "http://127.0.0.1:9",
+    TOKENMAXXING_CONFIG_DIR: join(root, "config"),
+    TOKENMAXXING_WWW_URL: "http://127.0.0.1:9",
+    ...options.env,
+  };
+}
+
+/**
+ * Starts `sync` with a ccusage that hangs, sends `signal` once ccusage is
+ * running, and reports how the CLI exited and whether ccusage outlived it.
+ */
+async function interruptSync(signal: NodeJS.Signals) {
+  const root = makeSandbox();
+  const pidFile = join(root, "calls.log.pid");
+  const child = spawn(bun, ["src/index.ts", "sync", "--dry-run", "--sources", "claude"], {
+    cwd: cliRoot,
+    env: cliEnv(root, { ccusage: "slow" }),
+    stdio: "ignore",
+  });
+  const exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((done) =>
+    child.on("exit", (code, exitSignal) => done({ code, signal: exitSignal })),
+  );
+  const ccusagePid = await waitFor(() =>
+    existsSync(pidFile) ? Number(readFileSync(pidFile, "utf8").trim()) || undefined : undefined,
+  );
+  child.kill(signal);
+  const exit = await exited;
+  const ccusageAlive = await waitFor(() => (isAlive(ccusagePid) ? undefined : false), 2_000).catch(
+    () => true,
+  );
+  if (ccusageAlive) {
+    process.kill(ccusagePid, "SIGKILL");
+  }
+
+  return { ccusageAlive, ...exit };
+}
+
+async function waitFor<T>(probe: () => T | undefined, timeoutMs = 20_000): Promise<T> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const value = probe();
+    if (value !== undefined) {
+      return value;
+    }
+    if (Date.now() > deadline) {
+      throw new Error("timed out waiting");
+    }
+    await new Promise((done) => setTimeout(done, 25));
+  }
+}
+
+function isAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function readServiceState(run: CliRun): Record<string, unknown> {
@@ -185,7 +255,8 @@ describe.skipIf(process.platform === "win32").concurrent("CLI argv parsing", () 
     { args: ["bootstrap"], output: "bootstrap needs a service decision", status: 1 },
     { args: ["sync", "--dry-run"], output: "Nothing to sync", status: 0 },
     { args: ["service", "status"], output: "Log:", status: 0 },
-    { args: ["service", "doctor"], output: "last success never", status: 0 },
+    // Nothing is installed in the sandbox: a FAIL check, so doctor exits 1.
+    { args: ["service", "doctor"], output: "last success never", status: 1 },
     { args: ["service", "uninstall"], output: "Automatic sync uninstalled", status: 0 },
     { args: ["service", "run"], output: "error: tokenmaxxing service run failed", status: 1 },
   ])("runs `$args` with its boolean flags omitted", { timeout: 30_000 }, async (testCase) => {
@@ -206,6 +277,39 @@ describe.skipIf(process.platform === "win32").concurrent("CLI argv parsing", () 
       // Reaching the handler is what matters: it records the (logged-out) attempt.
       expect(run.stdout).toContain('"event":"service_run"');
       expect(existsSync(join(run.configDir, "service-state.json"))).toBe(true);
+    },
+  );
+
+  // The Windows wrapper logs whatever the runner prints; a skip that printed
+  // nothing looked like a run that never started.
+  it(
+    "logs a scheduled run that finds another run holding the lock",
+    { timeout: 30_000 },
+    async () => {
+      const lockedAt = new Date().toISOString();
+      const run = await runCli(["service", "run", "--scheduled"], {
+        setup: (root) =>
+          writeFileSync(
+            join(root, "config", "service.lock"),
+            JSON.stringify({
+              acquiredAt: lockedAt,
+              hostname: hostname(),
+              ownerId: "other-run",
+              pid: process.pid,
+              version: 1,
+            }),
+          ),
+      });
+
+      expectParsed(run);
+      expect(run.status).toBe(0);
+      expect(JSON.parse(run.stdout.trim())).toMatchObject({
+        event: "service_run",
+        message: `Sync skipped; service run is already in progress (since ${lockedAt}, pid ${process.pid})`,
+        reason: "locked",
+        status: "skipped",
+      });
+      expect(existsSync(join(run.configDir, "service-state.json"))).toBe(false);
     },
   );
 
@@ -268,12 +372,119 @@ describe.skipIf(process.platform === "win32").concurrent("CLI argv parsing", () 
   });
 
   it("exits non-zero when every source fails", { timeout: 30_000 }, async () => {
-    const run = await runCli(["sync", "--dry-run"], { ccusage: "fail" });
+    const run = await runCli(["sync", "--dry-run"], {
+      ccusage: "fail",
+      setup: (root) => {
+        const projects = join(root, "home", ".claude", "projects", "app");
+        mkdirSync(projects, { recursive: true });
+        writeFileSync(join(projects, "session.jsonl"), "{}\n");
+      },
+    });
 
     expect(run.status).toBe(1);
     expect(run.stdout).toMatch(/^claude +failed/m);
-    expect(run.stderr).toContain("error: no usage synced; ccusage failed for claude, codex");
+    // Only claude has logs; the other 18 agents failed too but are counted.
+    expect(run.stderr).toContain(
+      "error: no usage synced; ccusage failed for claude and 18 agents without logs\nclaude and 18 agents without logs: ccusage command failed: fake ccusage failure",
+    );
   });
+
+  it(
+    "service doctor exits 1 on a FAIL check, with the verdict in --json",
+    { timeout: 30_000 },
+    async () => {
+      const run = await runCli(["service", "doctor", "--json"]);
+
+      expectParsed(run);
+      expect(run.status).toBe(1);
+      const report = JSON.parse(run.stdout) as {
+        checks: Array<{ fix?: string; label: string; status: string }>;
+        health: string;
+        status: string;
+      };
+      expect(report).toMatchObject({ health: "fail", status: "ok" });
+      expect(report.checks.find((check) => check.label === "scheduler")).toMatchObject({
+        fix: "install with tokenmaxxing service install",
+        status: "fail",
+      });
+      expect(JSON.parse(run.stderr.split("\n")[0] ?? "")).toMatchObject({
+        error: { code: "service_doctor_problems", health: "fail" },
+        status: "error",
+      });
+    },
+  );
+
+  // Only meaningful where no real bun/npx sits in /usr/bin or /bin, which stay on PATH.
+  it.skipIf(["/usr/bin/bun", "/usr/bin/npx", "/bin/bun", "/bin/npx"].some(existsSync))(
+    "says ccusage cannot run when neither bun nor npx is installed",
+    { timeout: 30_000 },
+    async () => {
+      const run = await runCli(["sync", "--dry-run", "--sources", "claude,codex"], {
+        ccusage: "missing",
+      });
+
+      expect(run.status).toBe(1);
+      // The test home may hold no agent logs, so the agents can be counted instead of named.
+      expect(run.stderr).toMatch(
+        /error: no usage synced; could not run ccusage for .+: neither bun nor npx is on PATH/,
+      );
+      expect(run.stderr).toContain("install Bun (https://bun.sh) or Node.js");
+    },
+  );
+
+  // FAIL-2 / FAIL-3: SIGTERM exited 130, and SIGHUP killed the CLI by default
+  // action and left the ccusage child running.
+  it.each([
+    { expected: 129, signal: "SIGHUP" as const },
+    { expected: 130, signal: "SIGINT" as const },
+    { expected: 143, signal: "SIGTERM" as const },
+  ])(
+    "exits $expected on $signal and stops the running ccusage",
+    { timeout: 30_000 },
+    async ({ expected, signal }) => {
+      const result = await interruptSync(signal);
+
+      expect(result).toEqual({ ccusageAlive: false, code: expected, signal: null });
+    },
+  );
+
+  // W2 (F5): repair from a shell without the service's TOKENMAXXING_CONFIG_DIR
+  // installed a service in the default config dir and took the scheduler over.
+  it("refuses to repair when no service is installed here", { timeout: 30_000 }, async () => {
+    const run = await runCli(["service", "repair"]);
+
+    expect(run.status).toBe(1);
+    expect(run.stderr).toContain(`no tokenmaxxing service is installed for ${run.configDir}`);
+    // Only the read-only scheduler status query ran; nothing was (re)registered.
+    expect(
+      run.calls.filter((call) => /bootstrap|enable|daemon-reload|\/Create/.test(call)),
+    ).toEqual([]);
+    expect(readdirSync(run.configDir)).not.toContain("service.json");
+  });
+
+  it(
+    "refuses to repair a service that another config dir installed",
+    { timeout: 30_000 },
+    async () => {
+      const other = "/Users/someone/other-config/tokenmaxxing.sh";
+      const run = await runCli(["service", "repair", "--json"], {
+        setup: (root) => {
+          const definition =
+            process.platform === "darwin"
+              ? join(root, "home", "Library", "LaunchAgents", "sh.tokenmaxxing.sync.plist")
+              : join(root, "home", ".config", "systemd", "user", "tokenmaxxing-sync.service");
+          mkdirSync(join(definition, ".."), { recursive: true });
+          writeFileSync(definition, `ProgramArguments ${other}\nExecStart="${other}"\n`);
+        },
+      });
+
+      expect(run.status).toBe(1);
+      expect(JSON.parse(run.stderr)).toMatchObject({
+        error: { code: "service_owned_elsewhere" },
+        status: "error",
+      });
+    },
+  );
 
   it("keeps the --json payload when every source fails", { timeout: 30_000 }, async () => {
     const run = await runCli(["sync", "--dry-run", "--json"], { ccusage: "fail" });

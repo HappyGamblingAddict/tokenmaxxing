@@ -2,10 +2,10 @@
 
 CLI for [tokenmaxxing](https://tokenmaxxing.sh) — the social leaderboard
 for LLM token usage. Parses your local agent usage (Claude Code, Codex,
-OpenCode, Gemini CLI, Copilot CLI, Hermes, Pi, Grok Build CLI, Antigravity,
-ZCode, Amp, Qwen Code, Kimi CLI, Kilo Code, Goose, Droid, Codebuff, OpenClaw)
-via [ccusage](https://github.com/ryoppippi/ccusage) and pushes daily
-aggregates to your public profile.
+OpenCode, Gemini CLI, Copilot CLI, Hermes, Pi, Oh My Pi, Grok Build CLI,
+Antigravity, ZCode, Amp, Qwen Code, Kimi CLI, Kilo Code, Goose, Droid,
+Codebuff, OpenClaw) via [ccusage](https://github.com/ryoppippi/ccusage) and
+pushes daily aggregates to your public profile.
 
 ## Usage
 
@@ -25,12 +25,20 @@ The background service uses the global `tokenmaxxing` binary and syncs every
 5 minutes. It auto-updates through the package manager that installed the
 global binary (bun, npm, pnpm, or yarn) when that package manager can be
 detected. Custom log roots (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `HERMES_HOME`,
-and the other agents' data-directory variables such as `GROK_HOME` or
-`AMP_DATA_DIR`) are captured at `tokenmaxxing service install` or `tokenmaxxing service
-repair`; rerun one of those after changing them. Without `HERMES_HOME`, Hermes
-usage includes every named profile under `~/.hermes/profiles/`.
+the other agents' data-directory variables such as `OPENCODE_DATA_DIR`,
+`GEMINI_DATA_DIR`, `COPILOT_HOME`, `PI_AGENT_DIR`, `GROK_HOME` or
+`AMP_DATA_DIR`, and `XDG_DATA_HOME`/`XDG_CONFIG_HOME`) are captured at
+`tokenmaxxing service install` or `tokenmaxxing service repair`; rerun one of
+those after changing them. Without `HERMES_HOME`, Hermes usage includes every
+named profile under `~/.hermes/profiles/`.
 Use `tokenmaxxing service status` for the last run and `tokenmaxxing service
 doctor` to inspect scheduler files, auth, auto-update, locks, and recent logs.
+Each doctor check is `OK`, `INFO` (fine, but worth knowing: never synced yet, a
+sync running right now), `WARN` (syncs still run, but something is off) or
+`FAIL` (scheduled syncs can't happen); every `WARN` and `FAIL` line ends with
+the command that fixes it. `service doctor` exits 1 when any check is `WARN` or
+`FAIL` and 0 otherwise, so scripts and CI can gate on it. With `--json`, the
+report's `health` is `ok`, `warn` or `fail` (`status` only says the doctor ran).
 
 Run `sync` as often as you like, from as many machines as you like —
 profiles aggregate across devices. Useful flags: `--dry-run`,
