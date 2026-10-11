@@ -4982,6 +4982,31 @@
                                   }
                                 ]
                               },
+                              "lastRejectedUsageAt": {
+                                "anyOf": [
+                                  {
+                                    "type": "string"
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
+                                ]
+                              },
+                              "rejectedUsageRows": {
+                                "anyOf": [
+                                  {
+                                    "type": "number"
+                                  },
+                                  {
+                                    "type": "string",
+                                    "enum": [
+                                      "Infinity",
+                                      "-Infinity",
+                                      "NaN"
+                                    ]
+                                  }
+                                ]
+                              },
                               "serviceAutoUpdateAttemptedAt": {
                                 "anyOf": [
                                   {
@@ -5276,6 +5301,8 @@
                               "platform",
                               "version",
                               "lastCheckInAt",
+                              "lastRejectedUsageAt",
+                              "rejectedUsageRows",
                               "serviceAutoUpdateAttemptedAt",
                               "serviceAutoUpdateCompletedAt",
                               "serviceAutoUpdateCurrentVersion",
@@ -5900,6 +5927,31 @@
                                       }
                                     ]
                                   },
+                                  "lastRejectedUsageAt": {
+                                    "anyOf": [
+                                      {
+                                        "type": "string"
+                                      },
+                                      {
+                                        "type": "null"
+                                      }
+                                    ]
+                                  },
+                                  "rejectedUsageRows": {
+                                    "anyOf": [
+                                      {
+                                        "type": "number"
+                                      },
+                                      {
+                                        "type": "string",
+                                        "enum": [
+                                          "Infinity",
+                                          "-Infinity",
+                                          "NaN"
+                                        ]
+                                      }
+                                    ]
+                                  },
                                   "serviceAutoUpdateAttemptedAt": {
                                     "anyOf": [
                                       {
@@ -6194,6 +6246,8 @@
                                   "platform",
                                   "version",
                                   "lastCheckInAt",
+                                  "lastRejectedUsageAt",
+                                  "rejectedUsageRows",
                                   "serviceAutoUpdateAttemptedAt",
                                   "serviceAutoUpdateCompletedAt",
                                   "serviceAutoUpdateCurrentVersion",
