@@ -219,19 +219,29 @@ function cmdArg(value: string): string {
 }
 
 /**
- * The shell to run `.cmd` shims through. `ComSpec` names the interpreter, and
- * this harness spawns it directly, so a value that is not an absolute path to
- * a `cmd.exe`-named program is not used: the suites are the only thing that
- * can set this environment, and a relative or unexpected name would turn every
- * shim call into a spawn of whatever that name happens to resolve to.
+ * The shell `.cmd` shims run through. Built from the suite's own root rather
+ * than read from `ComSpec`: the suites set the environment these runs inherit,
+ * and the interpreter is spawned directly, so an env string that names
+ * something other than the system `cmd.exe` would turn every shim call into a
+ * spawn of an unrelated program.
  */
 function windowsComSpec(): string {
-  const configured = process.env.ComSpec?.trim();
-  if (configured === undefined || !/^.*\\cmd\.exe$/i.test(configured)) {
-    return "C:\\Windows\\System32\\cmd.exe";
-  }
+  const root = envValue("SystemRoot") ?? envValue("windir");
+  return isAbsoluteWindowsPath(root) ? `${root}\\System32\\cmd.exe` : DEFAULT_WINDOWS_COMSPEC;
+}
 
-  return configured;
+const DEFAULT_WINDOWS_COMSPEC = "C:\\Windows\\System32\\cmd.exe";
+
+function envValue(name: string): string | undefined {
+  const key = Object.keys(process.env).find(
+    (candidate) => candidate.toUpperCase() === name.toUpperCase(),
+  );
+  const value = key === undefined ? undefined : process.env[key];
+  return value?.trim() === "" ? undefined : value?.trim();
+}
+
+function isAbsoluteWindowsPath(value: string | undefined): boolean {
+  return value !== undefined && /^[a-z]:[\\/]/i.test(value);
 }
 
 function cleanEnv(env: Record<string, string | undefined>): Record<string, string> {
