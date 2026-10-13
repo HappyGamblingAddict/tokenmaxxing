@@ -185,10 +185,7 @@ function oneLine(text: string | undefined, max = 600): string {
 function run(label: string, command: string, args: string[], options: RunOptions = {}): RunResult {
   const viaCmd = isWindows && !/\.(exe|com)$/i.test(command) && !isWindowsBuiltinExe(command);
   const argv = viaCmd
-    ? [
-        process.env.ComSpec ?? "C:\\Windows\\System32\\cmd.exe",
-        ["/d", "/s", "/c", `"${[command, ...args].map(cmdArg).join(" ")}"`],
-      ]
+    ? [windowsComSpec(), ["/d", "/s", "/c", `"${[command, ...args].map(cmdArg).join(" ")}"`]]
     : [command, args];
   const result = spawnSync(argv[0] as string, argv[1] as string[], {
     cwd: options.cwd,
@@ -219,6 +216,22 @@ function isWindowsBuiltinExe(command: string): boolean {
 
 function cmdArg(value: string): string {
   return /[\s&()^%!'"<>|]/.test(value) ? `"${value.replaceAll('"', '\\"')}"` : value;
+}
+
+/**
+ * The shell to run `.cmd` shims through. `ComSpec` names the interpreter, and
+ * this harness spawns it directly, so a value that is not an absolute path to
+ * a `cmd.exe`-named program is not used: the suites are the only thing that
+ * can set this environment, and a relative or unexpected name would turn every
+ * shim call into a spawn of whatever that name happens to resolve to.
+ */
+function windowsComSpec(): string {
+  const configured = process.env.ComSpec?.trim();
+  if (configured === undefined || !/^.*\\cmd\.exe$/i.test(configured)) {
+    return "C:\\Windows\\System32\\cmd.exe";
+  }
+
+  return configured;
 }
 
 function cleanEnv(env: Record<string, string | undefined>): Record<string, string> {

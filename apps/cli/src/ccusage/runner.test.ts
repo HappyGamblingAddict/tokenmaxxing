@@ -25,6 +25,7 @@ import {
   runCcusageSessionReport,
   sessionCcusageCommand,
   stderrTail,
+  versionTimeoutMs,
 } from "./runner";
 import type { CcusageSource } from "./sources";
 
@@ -941,6 +942,21 @@ describe("the ccusage version floor", () => {
         windowsVerbatimArguments: false,
       },
     );
+  });
+
+  // A ccusage that hangs on `--version` hangs on its reports too. Waiting out
+  // a full report timeout here would put two timeouts in front of the first
+  // report, doubling the wall time of a run against a dead registry. The
+  // report timeout stands in for the real 180 s so the test stays fast; what
+  // matters is that the read is cut short rather than run to its own limit.
+  it("gives the version read a shorter timeout than a report", () => {
+    // A read that hung for the whole report timeout would sit in front of the
+    // first report, doubling a run against a dead registry.
+    expect(versionTimeoutMs({})).toBeLessThan(180_000);
+    expect(versionTimeoutMs({ timeoutMs: 180_000 })).toBeLessThan(180_000);
+    expect(versionTimeoutMs({ timeoutMs: 30_000 })).toBeLessThan(30_000);
+    // Never a fraction that rounds away to nothing.
+    expect(versionTimeoutMs({ timeoutMs: 100 })).toBeGreaterThan(0);
   });
 });
 

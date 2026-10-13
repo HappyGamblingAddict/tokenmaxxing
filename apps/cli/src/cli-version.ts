@@ -141,16 +141,24 @@ function npmRegistryUrl(env: Record<string, string | undefined> = process.env): 
   return override ? override.replace(/\/+$/, "") : DEFAULT_NPM_REGISTRY_URL;
 }
 
+/**
+ * A package name as one path segment: npm's registry takes `@scope%2Fname`,
+ * so every `/` in the name is escaped, not just the first.
+ */
+function npmPackagePathSegment(packageName: string): string {
+  return packageName.replaceAll("/", "%2F");
+}
+
 /** A package's packument URL (`/@scope%2Fname`); append `/<version or dist-tag>` for one version. */
 function npmRegistryPackageUrl(
   packageName: string,
   env: Record<string, string | undefined> = process.env,
 ): string {
-  return `${npmRegistryUrl(env)}/${packageName.replace("/", "%2F")}`;
+  return `${npmRegistryUrl(env)}/${npmPackagePathSegment(packageName)}`;
 }
 
 function npmDistTagsUrl(env: Record<string, string | undefined> = process.env): string {
-  return `${npmRegistryUrl(env)}/-/package/${PACKAGE_NAME.replace("/", "%2F")}/dist-tags`;
+  return `${npmRegistryUrl(env)}/-/package/${npmPackagePathSegment(PACKAGE_NAME)}/dist-tags`;
 }
 
 function fetchDistTags(

@@ -280,4 +280,13 @@ describe("npmRegistryUrl", () => {
       "http://127.0.0.1:4873/@851-labs%2Ftokenmaxxing-linux-x64",
     );
   });
+
+  // The registry takes a package name as one path segment, so every `/` in it
+  // is escaped. Escaping only the first would leave a second one to end the
+  // segment early and address a different path.
+  it("escapes every slash in a package name, not just the first", () => {
+    const env = { TOKENMAXXING_NPM_REGISTRY: "http://127.0.0.1:4873/" };
+    expect(npmRegistryPackageUrl("@scope/a/b", env)).toBe("http://127.0.0.1:4873/@scope%2Fa%2Fb");
+    expect(npmRegistryPackageUrl("a/b/c", env)).toBe("http://127.0.0.1:4873/a%2Fb%2Fc");
+  });
 });

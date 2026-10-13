@@ -7,6 +7,14 @@ All notable changes to tokenmaxxing are documented here. Versions are anchored t
 
 ### Fixed
 
+- The `ccusage --version` read the sync does before its first report now gets a timeout of its
+  own, a third of the report timeout and never more than a minute. It ran under the full report
+  timeout, so a ccusage that hangs (npx against a black-holed network) cost two timeouts before
+  the first report instead of one, doubling the wall time of a run against a dead registry.
+- Two CodeQL alerts in `cli-version.ts`: a package name is now escaped as one path segment, with
+  every `/` replaced rather than only the first.
+- CodeQL alert in the CLI e2e harness: `ComSpec` is only used when it is an absolute path to a
+  `cmd.exe`-named program.
 - A sync now stops with a clear message, naming both versions, when the ccusage it resolves is older
   than this CLI can read reports from, instead of uploading whatever that ccusage happened to find.
   OpenCode v2.0 replaced its `storage/message` JSON and the legacy `message`/`part` tables with

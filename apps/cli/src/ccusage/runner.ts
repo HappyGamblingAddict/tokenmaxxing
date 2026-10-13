@@ -28,6 +28,17 @@ const CCUSAGE_SPEC = "ccusage@^20.0.22";
 /** The `20.0.22` in {@link CCUSAGE_SPEC}, as a comparable version. */
 const CCUSAGE_MIN_VERSION = "20.0.22";
 const RUN_TIMEOUT_MS = 180_000;
+/**
+ * How long the version read may take: at most this, and at most a fraction of
+ * the report timeout it shares a run with. A `ccusage --version` that hangs is
+ * a ccusage whose reports will hang too, and the check passes unreadable
+ * versions on, so there is nothing to wait for: waiting out a full report
+ * timeout here would put two timeouts in front of the first report, doubling
+ * the wall time of a run against a dead registry (the e2e suite's
+ * hanging-ccusage scenario asserts one).
+ */
+const VERSION_TIMEOUT_MS = 60_000;
+const VERSION_TIMEOUT_FRACTION = 3;
 const WINDOWS_NPX_SHIM = "npx.cmd";
 /** What `npm i -g bun` and pnpm put on PATH instead of bun.exe; cmd.exe has to run them. */
 const WINDOWS_BUN_SHIMS = ["bun.cmd", "bun.bat"] as const;
@@ -377,10 +388,13 @@ function resolveCcusageVersion(
   const platform = options.platform ?? process.platform;
   const run = options.run ?? makeCcusageCommandRunner(source, "daily");
   const invocations = ccusageCommandInvocations(["--version"], platform);
+  const context: CcusageRunContext = {
+    options: { ...options, timeoutMs: versionTimeoutMs(options) },
+    report: "daily",
+    source,
+  };
   return Effect.promise(() => ccusageSourceEnv(source, options.env ?? process.env, platform)).pipe(
-    Effect.flatMap((env) =>
-      runInvocations(invocations, env, run, { options, report: "daily", source }),
-    ),
+    Effect.flatMap((env) => runInvocations(invocations, env, run, context)),
     Effect.map((stdout) => parseCcusageVersion(stdout)),
     Effect.catch(() => Effect.succeed(undefined)),
   );
@@ -429,6 +443,12 @@ function atLeastCcusageVersion(version: string, floor: string): boolean {
   }
 
   return true;
+}
+
+/** The version read's share of the report timeout it sits in front of. */
+function versionTimeoutMs(options: ExecCcusageOptions): number {
+  const reportTimeout = options.timeoutMs ?? RUN_TIMEOUT_MS;
+  return Math.max(1, Math.min(reportTimeout / VERSION_TIMEOUT_FRACTION, VERSION_TIMEOUT_MS));
 }
 
 function withRunner(error: CcusageRunError, runner: string): CcusageRunError {
@@ -828,6 +848,7 @@ export {
   runCcusageSessionReport,
   sessionCcusageCommand,
   stderrTail,
+  versionTimeoutMs,
 };
 
 export type { CcusageReportKind, CcusageRunErrorCode, ExecCcusageOptions, RunOptions, WindowsBun };

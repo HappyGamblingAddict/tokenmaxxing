@@ -915,9 +915,12 @@ async function hangingCcusage() {
     hung.scheduler.finished && hung.scheduler.exitCode !== "0" && hung.scheduler.seconds < 300,
     `${hung.scheduler.detail}; ${hung.scheduler.seconds}s`,
   );
+  // The sync reads `ccusage --version` once per run before any report, so the
+  // preflight is excluded here: what this scenario bounds is report timeouts,
+  // and the preflight is bounded separately (a short timeout of its own).
   const calls = readFrom(callsLog, callsBefore)
     .split("\n")
-    .filter((line) => line.includes(" bun pid="));
+    .filter((line) => line.includes(" bun pid=") && !line.includes("--version"));
   check(
     name,
     "ccusage ran once (claude daily)",
