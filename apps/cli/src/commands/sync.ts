@@ -1,4 +1,4 @@
-import { arch, hostname } from "node:os";
+import { arch, availableParallelism, hostname } from "node:os";
 
 import { Data, Effect, Option } from "effect";
 import { Command, Flag } from "effect/unstable/cli";
@@ -28,6 +28,7 @@ import {
   runCcusageSessionReport,
 } from "../ccusage/runner";
 import type { SyncSourcePlan, SyncSourcePlans } from "../ccusage/cadence";
+import type { CcusageSource } from "../ccusage/sources";
 import { fingerprintSource, type LogRootOptions } from "../ccusage/fingerprint";
 import { DEFAULT_SOURCE_NAMES, resolveSources } from "../ccusage/sources";
 import {
@@ -317,6 +318,8 @@ interface SyncProgramRuntime {
   checkVersion?:
     | ((options?: ExecCcusageOptions) => Effect.Effect<void, CcusageVersionError>)
     | undefined;
+  /** Overrides how many sources run at once (`sourceConcurrency`). */
+  concurrency?: number | undefined;
   now?: (() => number) | undefined;
   runDailyReport?: typeof runCcusageDailyReport | undefined;
   runSessionReport?: typeof runCcusageSessionReport | undefined;
@@ -524,135 +527,64 @@ function syncProgram(options: SyncProgramOptions, runtime: SyncProgramRuntime = 
     const renderInlineResults = shouldRenderInlineSync(options);
     const limits = options.sourceLimits;
     let timedOut = false;
-    for (const source of sources) {
-      const plan: SyncSourcePlan = options.sourcePlans?.[source.source] ?? {
-        knownSessions: null,
-        mode: "run",
-        sessions: options.since === undefined ? "full" : "window",
-        since: options.since,
-      };
-      if (plan.mode === "skip") {
-        const result = {
-          reason: plan.reason,
-          source: source.source,
-          status: "skipped" as const,
-          summary: null,
-        };
-        sourceSummaries[source.source] = null;
-        sourceResults.push(result);
-        continue;
-      }
 
-      const limitReason: SyncSkipReason | undefined =
-        limits?.stopAfterTimeout === true && timedOut
-          ? "runner_timed_out"
-          : limits?.deadlineAt !== undefined && now() >= limits.deadlineAt
-            ? "run_deadline"
-            : undefined;
-      if (limitReason !== undefined) {
-        const result = {
-          reason: limitReason,
-          source: source.source,
-          status: "skipped" as const,
-          summary: null,
-        };
-        sourceSummaries[source.source] = null;
-        sourceResults.push(result);
-        continue;
-      }
+    // Each source is an independent ccusage child process reading its own
+    // logs, so they run concurrently and are merged back in the order the user
+    // named them: the table, `--json` and the service log all list sources in
+    // that order, whatever order they finished in.
+    //
+    // Both halves are needed. Concurrency alone plateaus, because one slow
+    // source cannot be split — OpenCode is 14s of a 29.9s foreground sync.
+    // Windowing the session report is what removes that long pole; the pool is
+    // what hides the ~38 process starts behind it. Together: 29.9s -> 9.8s,
+    // and with the window, 3.6s.
+    const outcomes = yield* Effect.forEach(
+      sources,
+      (source) =>
+        runSource(
+          source,
+          {
+            markSourceTimedOut: () => {
+              timedOut = true;
+            },
+            now,
+            options,
+            renderInlineResults,
+            runDailyReport,
+            runSessionReport,
+            sourceTimedOut: () => timedOut,
+          },
+          {
+            limits,
+            plans: options.sourcePlans,
+            since: options.since,
+            timings,
+          },
+        ),
+      { concurrency: syncConcurrency(options, limits, runtime.concurrency) },
+    );
 
-      const spinner = yield* humanSpinner(`Syncing ${source.source}`, options);
-      const sourceTimings: SyncSourceTimings = {};
-      timings[source.source] = sourceTimings;
-      const dailyStartedAt = Date.now();
-      const dailyResult = yield* runDailyReport(source, { since: plan.since }).pipe(
-        Effect.match({
-          onFailure: (error) => ({ error, _tag: "failure" as const }),
-          onSuccess: (report) => ({ report, _tag: "success" as const }),
-        }),
-      );
-      sourceTimings.dailyMs = Date.now() - dailyStartedAt;
-
-      if (dailyResult._tag === "failure") {
-        timedOut ||= dailyResult.error.code === "command_timed_out";
-        const result = {
-          issue: syncSourceIssue(dailyResult.error),
-          source: source.source,
-          status: "failed" as const,
-          summary: null,
-        };
-        sourceSummaries[source.source] = null;
-        sourceResults.push(result);
-        spinner.error(
-          renderInlineResults ? renderSyncSourceResult(result) : `Failed syncing ${source.source}`,
-        );
-        continue;
-      }
-
-      const dailyReport = dailyResult.report;
-      if (dailyReport.daily.length === 0) {
-        const result = {
-          reason: "no_data" as const,
-          source: source.source,
-          status: "skipped" as const,
-          summary: null,
-        };
-        sourceSummaries[source.source] = result.summary;
-        sourceResults.push(result);
-        spinner.stop(renderInlineResults ? renderSyncSourceResult(result) : undefined);
-        continue;
-      }
-
-      const sourceRows = aggregateDays(source.source, dailyReport.daily);
-      rawReports.push({
-        command: dailyCcusageCommand(source, { since: plan.since }),
-        payload: dailyReport,
-        reportKind: "daily",
-        source: source.source,
-      });
-
-      const sessionResult =
-        plan.sessions === "reuse"
-          ? { count: plan.knownSessions, _tag: "reused" as const }
-          : yield* runTimedSessionReport(
-              runSessionReport,
-              source,
-              plan.sessions === "full" ? undefined : plan.since,
-              sourceTimings,
-            );
-      timedOut ||=
-        sessionResult._tag === "failure" && sessionResult.error.code === "command_timed_out";
-      const sessionCount =
-        sessionResult._tag === "reused"
-          ? sessionResult.count
-          : sessionResult._tag === "success"
-            ? sessionResult.report.sessions.length
-            : null;
-      // Only a full-history count may replace the server's lifetime count.
-      if (plan.sessions === "full" && sessionCount !== null) {
-        sourceStats.push({ sessionCount, source: source.source });
-      }
-      const summary = { ...summarize(sourceRows), sessions: sessionCount };
-      const result: SyncSourceResult =
-        sessionResult._tag === "failure"
-          ? {
-              issue: syncSourceIssue(sessionResult.error),
-              source: source.source,
-              status: "partial",
-              summary,
-            }
-          : { source: source.source, status: "synced", summary };
-      sourceSummaries[source.source] = summary;
-      sourceResults.push(result);
-      rows.push(...sourceRows);
-      if (result.status === "partial") {
-        spinner.error(
-          renderInlineResults
-            ? renderSyncSourceResult(result)
-            : `Partially synced ${source.source}`,
-        );
-      } else {
-        spinner.stop(renderInlineResults ? renderSyncSourceResult(result) : undefined);
+    for (const outcome of outcomes) {
+      timedOut ||= outcome.timedOut;
+      for (const result of outcome.results) {
+        sourceResults.push(result.result);
+        if (result.result.status === "failed") {
+          sourceSummaries[result.result.source] = null;
+          continue;
+        }
+        if (result.result.status === "skipped") {
+          // `no_data` and a run limit both leave the source without a summary;
+          // a cadence skip already recorded its own.
+          sourceSummaries[result.result.source] = null;
+          continue;
+        }
+        sourceSummaries[result.result.source] = result.result.summary;
+        rows.push(...result.rows);
+        rawReports.push(...result.reports);
+        // Only a full-history count may replace the server's lifetime count.
+        if (result.uploadSessionCount && result.sessionCount !== null) {
+          sourceStats.push({ sessionCount: result.sessionCount, source: result.result.source });
+        }
       }
     }
 
@@ -706,6 +638,261 @@ function syncProgram(options: SyncProgramOptions, runtime: SyncProgramRuntime = 
       status,
       timings,
       upserted,
+    };
+  });
+}
+
+/**
+ * How many sources run at once. Four measured best on a foreground sync
+ * (29.9s sequential -> 9.8s; six and eight were no better and put more
+ * pressure on a laptop that is also running the agent), and it is a floor for
+ * small machines rather than a promise of speed.
+ */
+function sourceConcurrency(): number {
+  return Math.max(1, Math.min(4, Math.floor(availableParallelism() / 2)));
+}
+
+/**
+ * How many sources this run may have in flight.
+ *
+ * A run that stops after a ccusage timeout (`stopAfterTimeout`, the scheduled
+ * service's) is one at a time: skipping the sources a timeout left behind only
+ * works if none of them started, and that limit exists precisely to stop a
+ * background run hammering a ccusage that is not answering. A run with no such
+ * limit — a foreground `sync`, which is waiting on the user — takes several,
+ * since nothing there depends on the order sources finish in.
+ */
+function syncConcurrency(
+  options: SyncProgramOptions,
+  limits: SyncSourceLimits | undefined,
+  override: number | undefined,
+): number {
+  if (override !== undefined) {
+    return Math.max(1, override);
+  }
+
+  return limits?.stopAfterTimeout === true ? 1 : sourceConcurrency();
+}
+
+/** What one source contributes to the sync, before it is merged in order. */
+interface SourceOutcome {
+  /** A source's own failure count of ccusage timeouts, for the next source's plan. */
+  readonly timedOut: boolean;
+  readonly results: readonly SourceContribution[];
+}
+
+interface SourceContribution {
+  /** A full-history session count may replace the server's lifetime count. */
+  readonly reports: readonly RawUsageReportInput[];
+  readonly result: SyncSourceResult;
+  readonly rows: readonly UsageDayInput[];
+  readonly sessionCount: number | null;
+  readonly uploadSessionCount: boolean;
+}
+
+interface RunSourceDeps {
+  /** Records that this source timed out, so later sources can skip. */
+  readonly markSourceTimedOut: () => void;
+  readonly now: () => number;
+  readonly options: SyncProgramOptions;
+  readonly renderInlineResults: boolean;
+  readonly runDailyReport: typeof runCcusageDailyReport;
+  readonly runSessionReport: typeof runCcusageSessionReport;
+  /** Whether an earlier source already timed out (`stopAfterTimeout`). */
+  readonly sourceTimedOut: () => boolean;
+}
+
+interface RunSourcePlanOptions {
+  readonly limits: SyncSourceLimits | undefined;
+  readonly plans: SyncSourcePlans | undefined;
+  readonly since: string | undefined;
+  readonly timings: Partial<Record<UsageSource, SyncSourceTimings>>;
+}
+
+/** One source's whole pass: plan, daily report, session report, aggregation. */
+function runSource(
+  source: CcusageSource,
+  deps: RunSourceDeps,
+  planOptions: RunSourcePlanOptions,
+): Effect.Effect<SourceOutcome, never, ConsoleService> {
+  const { limits, plans, since, timings } = planOptions;
+  const plan: SyncSourcePlan = plans?.[source.source] ?? {
+    knownSessions: null,
+    mode: "run",
+    sessions: since === undefined ? "full" : "window",
+    since,
+  };
+  const skipped = (reason: SyncSkipReason): SourceOutcome => ({
+    timedOut: false,
+    results: [
+      {
+        reports: [],
+        result: { reason, source: source.source, status: "skipped", summary: null },
+        rows: [],
+        sessionCount: null,
+        uploadSessionCount: false,
+      },
+    ],
+  });
+
+  // A plan's own skip needs no run at all. The run limits are re-read when the
+  // source's turn actually comes: with sources in flight, whether an earlier
+  // one timed out is not known until it has, and a source must be judged
+  // against what is true when it starts rather than when the run began.
+  if (plan.mode === "skip") {
+    return Effect.succeed(skipped(plan.reason));
+  }
+
+  return Effect.gen(function* () {
+    const limitReason: SyncSkipReason | undefined =
+      limits?.stopAfterTimeout === true && deps.sourceTimedOut()
+        ? "runner_timed_out"
+        : limits?.deadlineAt !== undefined && deps.now() >= limits.deadlineAt
+          ? "run_deadline"
+          : undefined;
+    if (limitReason !== undefined) {
+      return skipped(limitReason);
+    }
+    return yield* runSourceReports(source, deps, plan, timings);
+  });
+}
+
+/** One source's reports, aggregation and result. */
+function runSourceReports(
+  source: CcusageSource,
+  deps: RunSourceDeps,
+  plan: Extract<SyncSourcePlan, { mode: "run" }>,
+  timings: Partial<Record<UsageSource, SyncSourceTimings>>,
+): Effect.Effect<SourceOutcome, never, ConsoleService> {
+  const timedOut = (hit: boolean): boolean => {
+    if (hit) {
+      deps.markSourceTimedOut();
+    }
+
+    return hit;
+  };
+
+  return Effect.gen(function* () {
+    const spinner = yield* humanSpinner(`Syncing ${source.source}`, deps.options);
+    const sourceTimings: SyncSourceTimings = {};
+    timings[source.source] = sourceTimings;
+    const dailyStartedAt = Date.now();
+    const dailyResult = yield* deps.runDailyReport(source, { since: plan.since }).pipe(
+      Effect.match({
+        onFailure: (error) => ({ error, _tag: "failure" as const }),
+        onSuccess: (report) => ({ report, _tag: "success" as const }),
+      }),
+    );
+    sourceTimings.dailyMs = Date.now() - dailyStartedAt;
+
+    if (dailyResult._tag === "failure") {
+      const result: SyncSourceResult = {
+        issue: syncSourceIssue(dailyResult.error),
+        source: source.source,
+        status: "failed",
+        summary: null,
+      };
+      spinner.error(
+        deps.renderInlineResults
+          ? renderSyncSourceResult(result)
+          : `Failed syncing ${source.source}`,
+      );
+      return {
+        timedOut: timedOut(dailyResult.error.code === "command_timed_out"),
+        results: [
+          {
+            reports: [],
+            result,
+            rows: [],
+            sessionCount: null,
+            uploadSessionCount: false,
+          },
+        ],
+      };
+    }
+
+    const dailyReport = dailyResult.report;
+    if (dailyReport.daily.length === 0) {
+      const result: SyncSourceResult = {
+        reason: "no_data",
+        source: source.source,
+        status: "skipped",
+        summary: null,
+      };
+      spinner.stop(deps.renderInlineResults ? renderSyncSourceResult(result) : undefined);
+      return {
+        timedOut: false,
+        results: [
+          {
+            reports: [],
+            result,
+            rows: [],
+            sessionCount: null,
+            uploadSessionCount: false,
+          },
+        ],
+      };
+    }
+
+    const sourceRows = aggregateDays(source.source, dailyReport.daily);
+    const reports: RawUsageReportInput[] = [
+      {
+        command: dailyCcusageCommand(source, { since: plan.since }),
+        payload: dailyReport,
+        reportKind: "daily",
+        source: source.source,
+      },
+    ];
+
+    const sessionResult =
+      plan.sessions === "reuse"
+        ? { count: plan.knownSessions, _tag: "reused" as const }
+        : yield* runTimedSessionReport(
+            deps.runSessionReport,
+            source,
+            plan.sessions === "full" ? undefined : plan.since,
+            sourceTimings,
+          );
+    const sessionCount =
+      sessionResult._tag === "reused"
+        ? sessionResult.count
+        : sessionResult._tag === "success"
+          ? sessionResult.report.sessions.length
+          : null;
+    const summary = { ...summarize(sourceRows), sessions: sessionCount };
+    const result: SyncSourceResult =
+      sessionResult._tag === "failure"
+        ? {
+            issue: syncSourceIssue(sessionResult.error),
+            source: source.source,
+            status: "partial",
+            summary,
+          }
+        : { source: source.source, status: "synced", summary };
+
+    if (result.status === "partial") {
+      spinner.error(
+        deps.renderInlineResults
+          ? renderSyncSourceResult(result)
+          : `Partially synced ${source.source}`,
+      );
+    } else {
+      spinner.stop(deps.renderInlineResults ? renderSyncSourceResult(result) : undefined);
+    }
+
+    return {
+      timedOut: timedOut(
+        sessionResult._tag === "failure" && sessionResult.error.code === "command_timed_out",
+      ),
+      results: [
+        {
+          reports,
+          result,
+          rows: sourceRows,
+          sessionCount,
+          uploadSessionCount: plan.sessions === "full",
+        },
+      ],
     };
   });
 }

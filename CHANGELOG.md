@@ -5,6 +5,18 @@ All notable changes to tokenmaxxing are documented here. Versions are anchored t
 
 ## Unreleased
 
+### Changed
+
+- A foreground `sync` now collects its sources concurrently, up to four at a time (half the
+  machine's parallelism, capped at four), instead of one after another. Each source is an
+  independent ccusage process reading its own logs, so nothing was shared between them; results
+  are still reported in the order the sources were named, so the table, `--json` and the service
+  log read the same as before. Measured on 19 sources: 36.9s -> 21.7s.
+- A sync that stops after a ccusage timeout — the scheduled service's own limit — still runs one
+  source at a time, because skipping the sources a timeout left behind only works if none of them
+  had started. The service is the run that has to stay bounded, so it is the one that stays
+  sequential; a manual sync, which is waiting on the user, takes the concurrency.
+
 ### Fixed
 
 - The `ccusage --version` read the sync does before its first report now gets a timeout of its
