@@ -17,6 +17,7 @@ const userFacingErrorTags = new Set([
   "AlreadyLoggedInError",
   "BootstrapCancelledError",
   "BootstrapServiceDecisionRequiredError",
+  "CcusageVersionUnsupportedError",
   "ConfigReadError",
   "ConfigWriteError",
   "InvalidBootstrapServiceOptionError",

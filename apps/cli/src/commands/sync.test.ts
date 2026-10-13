@@ -7,11 +7,11 @@ import * as HttpClientError from "effect/unstable/http/HttpClientError";
 import * as HttpClientRequest from "effect/unstable/http/HttpClientRequest";
 import { TestClock } from "effect/testing";
 import { Unauthorized, UserId, type AuthUser } from "@tokenmaxxing/api-contract";
-import { describe, expect, it } from "vite-plus/test";
+import { describe, expect, it, vi } from "vite-plus/test";
 
 import { ccusageDailyFixture } from "../../../api/src/testing/ccusage-fixtures";
 import { SCHEDULED_ME_RETRY_POLICY } from "../api-failure";
-import { CcusageRunError, stderrTail } from "../ccusage/runner";
+import { CcusageRunError, CcusageVersionError, stderrTail } from "../ccusage/runner";
 import {
   ApiClientService,
   BrowserService,
@@ -28,6 +28,7 @@ import { makeStubApiClient, type StubResponse } from "../testing/stub-api-client
 import { browserLoginEffect, NonInteractiveLoginError } from "./login";
 import { NotLoggedInError } from "./whoami";
 import {
+  CcusageVersionUnsupportedError,
   describeSyncSourcesFailure,
   formatSyncUsd,
   InvalidSinceError,
@@ -471,6 +472,68 @@ describe("sync source outcomes", () => {
       sourceResults,
       sources: { codex: null },
       status: "error",
+    });
+  });
+
+  // A ccusage older than the floor reads OpenCode's logs from the legacy
+  // tables OpenCode v2.0 stopped writing, and reports the history that ends
+  // there as if it were all of it. Every source comes back "synced" with a
+  // fraction of the usage, so the sync has to stop before any of them runs.
+  describe("the ccusage version floor", () => {
+    const { layer } = makeTestLayer({
+      initialConfig: {
+        apiUrl: "https://api.tokenmaxxing.example",
+        wwwUrl: "https://tokenmaxxing.example",
+      },
+      interactive: false,
+    });
+
+    it("fails the run once, naming both versions, before running any source", async () => {
+      const runDailyReport = vi.fn(() => Effect.succeed({ daily: [] }));
+
+      const exit = await Effect.runPromiseExit(
+        syncProgram(
+          { dryRun: true, json: true, sources: "opencode,codex" },
+          {
+            checkVersion: () => Effect.fail(new CcusageVersionError({ version: "20.0.19" })),
+            runDailyReport,
+          },
+        ).pipe(Effect.provide(layer)),
+      );
+
+      expect(exit._tag).toBe("Failure");
+      expect(runDailyReport).not.toHaveBeenCalled();
+      if (exit._tag !== "Failure") {
+        throw new Error("expected the version floor to fail the run");
+      }
+
+      const error = Cause.findErrorOption(exit.cause);
+      expect(Option.isSome(error)).toBe(true);
+      if (Option.isNone(error) || !(error.value instanceof CcusageVersionUnsupportedError)) {
+        throw new Error("expected a CcusageVersionUnsupportedError");
+      }
+
+      expect(error.value.cause.version).toBe("20.0.19");
+      expect(error.value.message).toContain("20.0.19");
+      expect(error.value.message).toContain("tokenmaxxing upgrade");
+    });
+
+    it("keeps a sync that runs the real ccusage from resolving a version twice", async () => {
+      const checkVersion = vi.fn(() => Effect.void);
+
+      await Effect.runPromise(
+        syncProgram(
+          { dryRun: true, json: true, sources: "opencode" },
+          {
+            checkVersion,
+            runDailyReport: () =>
+              Effect.succeed({ daily: [{ date: "2026-07-22", totalTokens: 10 }] }),
+            runSessionReport: () => Effect.succeed({ sessions: [] }),
+          },
+        ).pipe(Effect.provide(layer)),
+      );
+
+      expect(checkVersion).toHaveBeenCalledOnce();
     });
   });
 

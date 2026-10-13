@@ -15,12 +15,15 @@ import packageJson from "../../package.json";
 import { booleanFlag } from "../flags";
 import { aggregateDays, summarize, type SourceSummary } from "../ccusage/aggregate";
 import {
+  checkCcusageVersion,
   type CcusageReportKind,
   CcusageRunError,
   type CcusageRunErrorCode,
+  CcusageVersionError,
   ccusageRunDiagnostic,
   ccusageStderrReason,
   dailyCcusageCommand,
+  type ExecCcusageOptions,
   runCcusageDailyReport,
   runCcusageSessionReport,
 } from "../ccusage/runner";
@@ -124,6 +127,19 @@ class InvalidSinceError extends Data.TaggedError("InvalidSinceError")<{
  * reflects the failure. A "partial" sync is not an error: whatever was
  * collected was pushed, and the payload/table name the degraded sources.
  */
+/**
+ * The ccusage the runner resolves cannot read the agents' current storage (see
+ * `checkCcusageVersion`). Raised before the per-source results, so nothing
+ * looks synced.
+ */
+class CcusageVersionUnsupportedError extends Data.TaggedError("CcusageVersionUnsupportedError")<{
+  readonly cause: CcusageVersionError;
+}> {
+  override get message() {
+    return `error: ${this.cause.message}`;
+  }
+}
+
 class SyncSourcesFailedError extends Data.TaggedError(
   "SyncSourcesFailedError",
 )<SyncSourcesFailure> {
@@ -292,6 +308,15 @@ interface SyncSourceLimits {
 }
 
 interface SyncProgramRuntime {
+  /**
+   * Whether the ccusage the runner resolves can read the agents' current
+   * storage (`ccusage/runner`'s `checkCcusageVersion`). Only a runtime that
+   * replaces the reports stubs this: a sync that runs the real ccusage is the
+   * only one that can resolve one.
+   */
+  checkVersion?:
+    | ((options?: ExecCcusageOptions) => Effect.Effect<void, CcusageVersionError>)
+    | undefined;
   now?: (() => number) | undefined;
   runDailyReport?: typeof runCcusageDailyReport | undefined;
   runSessionReport?: typeof runCcusageSessionReport | undefined;
@@ -470,6 +495,20 @@ function syncProgram(options: SyncProgramOptions, runtime: SyncProgramRuntime = 
     const { invalid, sources } = resolveSources(requested);
     if (invalid.length > 0) {
       return yield* Effect.fail(new UnknownSourceError({ names: invalid }));
+    }
+
+    // Once per run, before any source: an agent whose storage moved on is read
+    // from the wrong place by a ccusage that predates the move, and it reports
+    // the short history as if it were complete, so every source would come back
+    // "synced" with a fraction of the usage. One clear failure beats that.
+    // Stubbed reports are not a real ccusage to check.
+    const checkVersion =
+      runtime.checkVersion ??
+      (runtime.runDailyReport === undefined ? checkCcusageVersion : undefined);
+    if (checkVersion !== undefined) {
+      yield* checkVersion().pipe(
+        Effect.mapError((cause) => new CcusageVersionUnsupportedError({ cause })),
+      );
     }
 
     const auth = options.dryRun
@@ -1078,6 +1117,7 @@ function formatCount(value: number, noun: string): string {
 }
 
 export {
+  CcusageVersionUnsupportedError,
   describeSyncSourcesFailure,
   failedSyncSources,
   formatSyncUsd,

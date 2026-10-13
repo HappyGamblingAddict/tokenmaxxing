@@ -19,7 +19,14 @@ import { type CcusageEnv, ccusageSourceArgs, ccusageSourceEnv } from "./source-e
 
 // 20.0.21 added the Antigravity and ZCode adapters; 20.0.22 stopped dropping
 // claude-fable-5-1 usage. Earlier v20 releases also carry the Codex replay fix.
+//
+// 20.0.21 is also the first release whose OpenCode adapter reads OpenCode's
+// current database (`session_v2`/`session_message` in `opencode.db`); 20.0.19
+// and 20.0.20 read only the legacy `message`/`part` tables, which OpenCode
+// v2.0 stopped writing. See `resolveCcusageVersion`.
 const CCUSAGE_SPEC = "ccusage@^20.0.22";
+/** The `20.0.22` in {@link CCUSAGE_SPEC}, as a comparable version. */
+const CCUSAGE_MIN_VERSION = "20.0.22";
 const RUN_TIMEOUT_MS = 180_000;
 const WINDOWS_NPX_SHIM = "npx.cmd";
 /** What `npm i -g bun` and pnpm put on PATH instead of bun.exe; cmd.exe has to run them. */
@@ -59,6 +66,24 @@ const EMPTY_REPORTS: Record<CcusageReportKind, string> = {
   daily: JSON.stringify({ daily: [], totals: null }),
   session: JSON.stringify({ sessions: [], totals: null }),
 };
+
+/**
+ * A ccusage that resolved below the floor this CLI's reports can be read
+ * from. Kept apart from {@link CcusageRunError}: nothing was run per source,
+ * so every source would fail with the same reason and the sync says so once,
+ * naming the two versions.
+ */
+class CcusageVersionError extends Data.TaggedError("CcusageVersionError")<{
+  readonly cause?: unknown;
+  readonly runner?: string | undefined;
+  readonly version?: string | undefined;
+}> {
+  override get message() {
+    return this.version === undefined
+      ? `ccusage ${CCUSAGE_SPEC} is older than the ${CCUSAGE_MIN_VERSION} this CLI reads reports from; update the CLI with \`tokenmaxxing upgrade\``
+      : `ccusage ${this.version} is older than the ${CCUSAGE_MIN_VERSION} this CLI reads reports from; update the CLI with \`tokenmaxxing upgrade\``;
+  }
+}
 
 class CcusageRunError extends Data.TaggedError("CcusageRunError")<{
   readonly cause: unknown;
@@ -223,45 +248,6 @@ function execCcusage(
 ): Effect.Effect<string, CcusageRunError> {
   const run = options.run ?? makeCcusageCommandRunner(source, report);
   const platform = options.platform ?? process.platform;
-  const runInvocation = (invocation: CcusageCommandInvocation, env: CcusageEnv) =>
-    Effect.promise(() =>
-      invocation.shim === undefined
-        ? Promise.resolve(true)
-        : findOnWindowsPath(invocation.shim, env).then((found) => found !== undefined),
-    ).pipe(
-      Effect.flatMap((found) =>
-        found
-          ? run(invocation.command, invocation.args, env, {
-              windowsVerbatimArguments: invocation.windowsVerbatimArguments ?? false,
-            })
-          : Effect.fail(
-              new CcusageRunError({
-                cause: Object.assign(new Error(`${invocation.shim} is not on PATH`), {
-                  code: "ENOENT",
-                }),
-                code: "command_not_found",
-                report,
-                source,
-              }),
-            ),
-      ),
-      Effect.timeout(`${Math.max(1, options.timeoutMs ?? RUN_TIMEOUT_MS)} millis`),
-      Effect.mapError((error) =>
-        error instanceof CcusageRunError
-          ? bunXRejection(withRunner(error, invocation.runner))
-          : new CcusageRunError({
-              cause: error,
-              code: "command_timed_out",
-              report,
-              runner: invocation.runner,
-              source,
-            }),
-      ),
-    );
-  // The next runner gets a turn only when this one never ran ccusage: missing, refused by the OS
-  // or the runtime (Bun 1.4 throws for a .cmd it cannot quote), or a bun that does not take
-  // `bun x`. A ccusage that ran and failed is reported as is, never hidden behind another
-  // runner's attempt.
   const runInvocations = (
     invocations: readonly CcusageCommandInvocation[],
     env: CcusageEnv,
@@ -271,7 +257,7 @@ function execCcusage(
     if (invocation === undefined) {
       return Effect.fail(reportedFailure(tried));
     }
-    return runInvocation(invocation, env).pipe(
+    return runCcusageInvocation(invocation, env, run, { options, report, source }).pipe(
       Effect.catch((error: CcusageRunError) =>
         rest.length > 0 && neverRanCcusage(error)
           ? runInvocations(rest, env, [...tried, error])
@@ -299,6 +285,150 @@ function execCcusage(
       );
     }),
   );
+}
+
+/** What `runInvocations` needs to report a failure against one ccusage report. */
+interface CcusageRunContext {
+  readonly options: ExecCcusageOptions;
+  readonly report: CcusageReportKind;
+  readonly source: string;
+}
+
+/** One invocation: the shim on PATH (Windows), then ccusage, then the timeout. */
+function runCcusageInvocation(
+  invocation: CcusageCommandInvocation,
+  env: CcusageEnv,
+  run: CcusageCommandRunner,
+  context: CcusageRunContext,
+): Effect.Effect<string, CcusageRunError> {
+  const { options, report, source } = context;
+  return Effect.promise(() =>
+    invocation.shim === undefined
+      ? Promise.resolve(true)
+      : findOnWindowsPath(invocation.shim, env).then((found) => found !== undefined),
+  ).pipe(
+    Effect.flatMap((found) =>
+      found
+        ? run(invocation.command, invocation.args, env, {
+            windowsVerbatimArguments: invocation.windowsVerbatimArguments ?? false,
+          })
+        : Effect.fail(
+            new CcusageRunError({
+              cause: Object.assign(new Error(`${invocation.shim} is not on PATH`), {
+                code: "ENOENT",
+              }),
+              code: "command_not_found",
+              report,
+              source,
+            }),
+          ),
+    ),
+    Effect.timeout(`${Math.max(1, options.timeoutMs ?? RUN_TIMEOUT_MS)} millis`),
+    Effect.mapError((error) =>
+      error instanceof CcusageRunError
+        ? bunXRejection(withRunner(error, invocation.runner))
+        : new CcusageRunError({
+            cause: error,
+            code: "command_timed_out",
+            report,
+            runner: invocation.runner,
+            source,
+          }),
+    ),
+  );
+}
+
+/**
+ * The next runner gets a turn only when this one never ran ccusage: missing,
+ * refused by the OS or the runtime (Bun 1.4 throws for a .cmd it cannot
+ * quote), or a bun that does not take `bun x`. A ccusage that ran and failed is
+ * reported as is, never hidden behind another runner's attempt.
+ */
+function runInvocations(
+  invocations: readonly CcusageCommandInvocation[],
+  env: CcusageEnv,
+  run: CcusageCommandRunner,
+  context: CcusageRunContext,
+  tried: readonly CcusageRunError[] = [],
+): Effect.Effect<string, CcusageRunError> {
+  const [invocation, ...rest] = invocations;
+  if (invocation === undefined) {
+    return Effect.fail(reportedFailure(tried));
+  }
+  return runCcusageInvocation(invocation, env, run, context).pipe(
+    Effect.catch((error: CcusageRunError) =>
+      rest.length > 0 && neverRanCcusage(error)
+        ? runInvocations(rest, env, run, context, [...tried, error])
+        : Effect.fail(reportedFailure([...tried, error])),
+    ),
+  );
+}
+
+/**
+ * The version the runner resolved, as `ccusage --version` reports it, or
+ * `undefined` when it printed nothing this can read. An unreadable version
+ * costs only the check: the reports themselves decide whether ccusage works,
+ * so a ccusage that refuses `--version` still syncs.
+ */
+function resolveCcusageVersion(
+  options: ExecCcusageOptions = {},
+): Effect.Effect<string | undefined, never> {
+  const source = "version";
+  const platform = options.platform ?? process.platform;
+  const run = options.run ?? makeCcusageCommandRunner(source, "daily");
+  const invocations = ccusageCommandInvocations(["--version"], platform);
+  return Effect.promise(() => ccusageSourceEnv(source, options.env ?? process.env, platform)).pipe(
+    Effect.flatMap((env) =>
+      runInvocations(invocations, env, run, { options, report: "daily", source }),
+    ),
+    Effect.map((stdout) => parseCcusageVersion(stdout)),
+    Effect.catch(() => Effect.succeed(undefined)),
+  );
+}
+
+/**
+ * Fails the sync when the ccusage the runner resolved cannot read the agents'
+ * current storage. This runs once per sync, not per source: every source
+ * resolves the same spec, so one read answers for all of them and a stale
+ * ccusage — which reads an agent's logs from where that agent used to write
+ * them, and reports the result as if it were complete — is reported once
+ * instead of as a per-source failure.
+ *
+ * A version that cannot be read passes: that is this check's own limitation,
+ * not the agent's.
+ */
+function checkCcusageVersion(
+  options: ExecCcusageOptions = {},
+): Effect.Effect<void, CcusageVersionError> {
+  return resolveCcusageVersion(options).pipe(
+    Effect.flatMap((version) =>
+      version === undefined || atLeastCcusageVersion(version, CCUSAGE_MIN_VERSION)
+        ? Effect.void
+        : Effect.fail(new CcusageVersionError({ cause: `ccusage ${version}`, version })),
+    ),
+  );
+}
+
+/** `20.0.30` out of what `ccusage --version` printed, e.g. `ccusage 20.0.30`. */
+function parseCcusageVersion(stdout: string): string | undefined {
+  const match = /\bccusage\s+v?(\d+(?:\.\d+)*)/.exec(stdout);
+  return match?.[1];
+}
+
+/** Whether `version` is `floor` or newer; segments compare numerically. */
+function atLeastCcusageVersion(version: string, floor: string): boolean {
+  const segments = (value: string) =>
+    value.split(".").map((segment) => Number.parseInt(segment, 10) || 0);
+  const found = segments(version);
+  const required = segments(floor);
+  for (const index of [0, 1, 2]) {
+    const difference = (found[index] ?? 0) - (required[index] ?? 0);
+    if (difference !== 0) {
+      return difference > 0;
+    }
+  }
+
+  return true;
 }
 
 function withRunner(error: CcusageRunError, runner: string): CcusageRunError {
@@ -680,7 +810,11 @@ function isMissingCommand(cause: unknown): boolean {
 }
 
 export {
+  atLeastCcusageVersion,
+  CCUSAGE_MIN_VERSION,
+  checkCcusageVersion,
   CcusageRunError,
+  CcusageVersionError,
   ccusageCommandInvocations,
   ccusageRunDiagnostic,
   ccusageStderrReason,
@@ -688,10 +822,12 @@ export {
   execCcusage,
   findWindowsBun,
   killProcessTree,
+  parseCcusageVersion,
+  resolveCcusageVersion,
   runCcusageDailyReport,
   runCcusageSessionReport,
   sessionCcusageCommand,
   stderrTail,
 };
 
-export type { CcusageReportKind, CcusageRunErrorCode, RunOptions, WindowsBun };
+export type { CcusageReportKind, CcusageRunErrorCode, ExecCcusageOptions, RunOptions, WindowsBun };

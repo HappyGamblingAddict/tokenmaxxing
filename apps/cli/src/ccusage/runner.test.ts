@@ -8,13 +8,19 @@ import { TestClock } from "effect/testing";
 import { describe, expect, it, vi } from "vite-plus/test";
 
 import {
+  atLeastCcusageVersion,
+  CCUSAGE_MIN_VERSION,
+  checkCcusageVersion,
   CcusageRunError,
+  CcusageVersionError,
   ccusageCommandInvocations,
   ccusageRunDiagnostic,
   ccusageStderrReason,
   dailyCcusageCommand,
   execCcusage,
   findWindowsBun,
+  parseCcusageVersion,
+  resolveCcusageVersion,
   runCcusageDailyReport,
   runCcusageSessionReport,
   sessionCcusageCommand,
@@ -36,7 +42,10 @@ function missingBun(source: string) {
   });
 }
 
-async function ccusageErrorFor<A>(effect: Effect.Effect<A, CcusageRunError>) {
+async function ccusageErrorFor<E>(
+  effect: Effect.Effect<unknown, E>,
+  kind: new (...args: never[]) => E,
+) {
   const exit = await Effect.runPromiseExit(effect);
   expect(exit._tag).toBe("Failure");
   if (exit._tag !== "Failure") {
@@ -45,11 +54,15 @@ async function ccusageErrorFor<A>(effect: Effect.Effect<A, CcusageRunError>) {
 
   const error = Cause.findErrorOption(exit.cause);
   expect(Option.isSome(error)).toBe(true);
-  if (Option.isNone(error) || !(error.value instanceof CcusageRunError)) {
-    throw new Error("expected typed ccusage error");
+  if (Option.isNone(error) || !(error.value instanceof kind)) {
+    throw new Error(`expected a ${kind.name} in the error channel`);
   }
 
   return error.value;
+}
+
+function ccusageRunErrorFor(effect: Effect.Effect<unknown, CcusageRunError>) {
+  return ccusageErrorFor(effect, CcusageRunError);
 }
 
 describe("ccusage commands", () => {
@@ -370,7 +383,7 @@ describe("execCcusage", () => {
     await windowsPath([], async (emptyDir) => {
       const run = vi.fn(() => Effect.succeed('{"daily":[]}'));
 
-      const error = await ccusageErrorFor(
+      const error = await ccusageRunErrorFor(
         execCcusage(["codex", "daily"], "codex", "daily", {
           env: { PATH: emptyDir },
           platform: "win32",
@@ -416,7 +429,7 @@ describe("execCcusage", () => {
       .mockReturnValueOnce(Effect.fail(notStarted("codex", "ERR_INVALID_ARG_VALUE")))
       .mockReturnValueOnce(Effect.fail(exited("codex", 1)));
 
-    const error = await ccusageErrorFor(
+    const error = await ccusageRunErrorFor(
       execCcusage(["codex", "daily"], "codex", "daily", { platform: "linux", run }),
     );
 
@@ -430,7 +443,7 @@ describe("execCcusage", () => {
     await windowsPath(["bun.cmd"], async (dir) => {
       const run = vi.fn(() => Effect.fail(notStarted("codex", "EINVAL")));
 
-      const error = await ccusageErrorFor(
+      const error = await ccusageRunErrorFor(
         execCcusage(["codex", "daily"], "codex", "daily", {
           env: { PATH: dir },
           platform: "win32",
@@ -449,7 +462,7 @@ describe("execCcusage", () => {
       const failedBun = exited("codex", 1, "error: ccusage blew up");
       const run = vi.fn(() => Effect.fail(failedBun));
 
-      const error = await ccusageErrorFor(
+      const error = await ccusageRunErrorFor(
         execCcusage(["codex", "daily"], "codex", "daily", {
           env: { PATH: dir },
           platform: "win32",
@@ -518,7 +531,7 @@ describe("execCcusage", () => {
       .mockReturnValueOnce(Effect.fail(exited("codex", 1, 'error: Script not found "x"')))
       .mockReturnValueOnce(Effect.fail(missingBun("codex")));
 
-    const error = await ccusageErrorFor(
+    const error = await ccusageRunErrorFor(
       execCcusage(["codex", "daily"], "codex", "daily", { env: {}, platform: "linux", run }),
     );
 
@@ -537,7 +550,7 @@ describe("execCcusage", () => {
       .mockReturnValueOnce(Effect.fail(exited("codex", 1, 'error: missing script "x"')))
       .mockReturnValueOnce(Effect.fail(exited("codex", 1)));
 
-    const error = await ccusageErrorFor(
+    const error = await ccusageRunErrorFor(
       execCcusage(["codex", "daily"], "codex", "daily", { env: {}, platform: "linux", run }),
     );
 
@@ -554,7 +567,7 @@ describe("execCcusage", () => {
   ])("reports a bun that ran ccusage as failed, without npx, for %s", async (_, stderr) => {
     const run = vi.fn(() => Effect.fail(exited("codex", 1, stderr)));
 
-    const error = await ccusageErrorFor(
+    const error = await ccusageRunErrorFor(
       execCcusage(["codex", "daily"], "codex", "daily", { env: {}, platform: "linux", run }),
     );
 
@@ -570,7 +583,7 @@ describe("execCcusage", () => {
       .mockReturnValueOnce(Effect.fail(missingBun("codex")))
       .mockReturnValueOnce(Effect.fail(exited("codex", 1, 'error: Script not found "x"')));
 
-    const error = await ccusageErrorFor(
+    const error = await ccusageRunErrorFor(
       execCcusage(["codex", "daily"], "codex", "daily", { env: {}, platform: "linux", run }),
     );
 
@@ -582,7 +595,7 @@ describe("execCcusage", () => {
   it("classifies command timeouts without trying the npm fallback", async () => {
     const run = vi.fn(() => Effect.never);
 
-    const error = await ccusageErrorFor(
+    const error = await ccusageRunErrorFor(
       execCcusage(["codex", "daily"], "codex", "daily", {
         platform: "linux",
         run,
@@ -847,6 +860,90 @@ describe("ccusage stderr", () => {
   });
 });
 
+describe("the ccusage version floor", () => {
+  it("reads the version the runner reports", async () => {
+    const run = vi.fn(() => Effect.succeed("ccusage 20.0.30\n"));
+
+    await expect(
+      Effect.runPromise(resolveCcusageVersion({ env: {}, platform: "linux", run })),
+    ).resolves.toBe("20.0.30");
+  });
+
+  // OpenCode v2.0 stopped writing the legacy message/part tables its adapter
+  // reads, so 20.0.19/20.0.20 report a history that ends weeks early and look
+  // complete. A floor that does not catch that leaves the sync reporting it.
+  it("refuses a ccusage that predates the OpenCode database its adapter reads", async () => {
+    const run = vi.fn(() => Effect.succeed("ccusage 20.0.19\n"));
+    const error = await ccusageErrorFor(
+      checkCcusageVersion({ env: {}, platform: "linux", run }),
+      CcusageVersionError,
+    );
+
+    expect(error.version).toBe("20.0.19");
+    expect(error.message).toContain(CCUSAGE_MIN_VERSION);
+    expect(error.message).toContain("tokenmaxxing upgrade");
+  });
+
+  it("accepts the floor itself and anything newer", async () => {
+    for (const version of ["20.0.22", "20.0.30", "20.1.0", "21.0.0"]) {
+      await expect(
+        Effect.runPromise(
+          checkCcusageVersion({
+            env: {},
+            platform: "linux",
+            run: () => Effect.succeed(`ccusage ${version}\n`),
+          }),
+        ),
+      ).resolves.toBeUndefined();
+    }
+  });
+
+  it("compares versions numerically, not as text", () => {
+    expect(atLeastCcusageVersion("20.0.22", CCUSAGE_MIN_VERSION)).toBe(true);
+    expect(atLeastCcusageVersion("20.0.9", CCUSAGE_MIN_VERSION)).toBe(false);
+    expect(atLeastCcusageVersion("9.9.9", CCUSAGE_MIN_VERSION)).toBe(false);
+    expect(atLeastCcusageVersion("20.0.30", "20.0.30")).toBe(true);
+  });
+
+  // ccusage that will not print a version has not shown it cannot read the
+  // reports, and the reports are what this CLI is here to run.
+  it("lets a sync through when the version cannot be read", async () => {
+    const run = vi.fn(() => Effect.fail(missingBun("version")));
+
+    await expect(
+      Effect.runPromise(checkCcusageVersion({ env: {}, platform: "linux", run })),
+    ).resolves.toBeUndefined();
+  });
+
+  it("passes an unparseable version rather than failing the sync", () => {
+    expect(parseCcusageVersion("ccusage 20.0.30\n")).toBe("20.0.30");
+    expect(parseCcusageVersion("ccusage 20.1.0-beta.3\n")).toBe("20.1.0");
+    expect(parseCcusageVersion("command not found: ccusage\n")).toBeUndefined();
+    expect(parseCcusageVersion('{"daily":[]}')).toBeUndefined();
+  });
+
+  // One read answers for every source, so the check cannot cost a sync an
+  // extra ccusage install per agent.
+  it("asks the runner for the version once per sync", async () => {
+    const run = vi.fn(() => Effect.succeed("ccusage 20.0.30\n"));
+    const options = { env: {}, platform: "linux" as const, run };
+
+    await Effect.runPromise(resolveCcusageVersion(options));
+    await Effect.runPromise(resolveCcusageVersion(options));
+    await Effect.runPromise(resolveCcusageVersion(options));
+
+    expect(run).toHaveBeenCalledTimes(3);
+    expect(run).toHaveBeenCalledWith(
+      "bun",
+      ["x", "ccusage@^20.0.22", "--version"],
+      expect.anything(),
+      {
+        windowsVerbatimArguments: false,
+      },
+    );
+  });
+});
+
 describe("runCcusageDailyReport", () => {
   it("returns valid empty reports as data instead of a runner failure", async () => {
     const report = await Effect.runPromise(
@@ -898,7 +995,7 @@ describe("runCcusageDailyReport", () => {
   });
 
   it("classifies malformed JSON", async () => {
-    const error = await ccusageErrorFor(
+    const error = await ccusageRunErrorFor(
       runCcusageDailyReport(codex, {
         exec: { run: () => Effect.succeed("not json") },
       }),
@@ -909,7 +1006,7 @@ describe("runCcusageDailyReport", () => {
   });
 
   it("classifies JSON that does not match the report schema", async () => {
-    const error = await ccusageErrorFor(
+    const error = await ccusageRunErrorFor(
       runCcusageDailyReport(codex, {
         exec: { run: () => Effect.succeed('{"sessions":[]}') },
       }),
@@ -989,7 +1086,7 @@ describe.skipIf(process.platform === "win32")("the real ccusage command runner",
       `echo "noise" >&2\necho "/usr/bin/env: 'node': No such file or directory" >&2\nexit 127`,
     );
     try {
-      const error = await ccusageErrorFor(
+      const error = await ccusageRunErrorFor(
         execCcusage(["codex", "daily"], "codex", "daily", {
           env: { PATH: `${dir}:/usr/bin:/bin` },
         }),
@@ -1007,7 +1104,7 @@ describe.skipIf(process.platform === "win32")("the real ccusage command runner",
     try {
       // Node's spawn throws synchronously for a NUL in the environment, as it (and Bun 1.4) does
       // with EINVAL for a Windows .cmd started without a shell.
-      const error = await ccusageErrorFor(
+      const error = await ccusageRunErrorFor(
         execCcusage(["codex", "daily"], "codex", "daily", {
           env: { BROKEN: "a\0b", PATH: `${dir}:/usr/bin:/bin` },
         }),
@@ -1062,7 +1159,7 @@ describe.skipIf(process.platform === "win32")("the real ccusage command runner",
     // Only the fake bun on PATH: CI runners have a real npx in /usr/bin or /usr/local/bin.
     const dir = await fakeBun(`echo 'error: Script not found "x"' >&2\nexit 1`);
     try {
-      const error = await ccusageErrorFor(
+      const error = await ccusageRunErrorFor(
         execCcusage(["codex", "daily"], "codex", "daily", { env: { PATH: dir } }),
       );
 
@@ -1078,7 +1175,7 @@ describe.skipIf(process.platform === "win32")("the real ccusage command runner",
   it("says how a runner ended when it printed nothing", async () => {
     const dir = await fakeBun(`exit 3`);
     try {
-      const error = await ccusageErrorFor(
+      const error = await ccusageRunErrorFor(
         execCcusage(["codex", "daily"], "codex", "daily", {
           env: { PATH: `${dir}:/usr/bin:/bin` },
         }),

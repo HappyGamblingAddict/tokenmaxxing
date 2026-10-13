@@ -5,6 +5,21 @@ All notable changes to tokenmaxxing are documented here. Versions are anchored t
 
 ## Unreleased
 
+### Fixed
+
+- A sync now stops with a clear message, naming both versions, when the ccusage it resolves is older
+  than this CLI can read reports from, instead of uploading whatever that ccusage happened to find.
+  OpenCode v2.0 replaced its `storage/message` JSON and the legacy `message`/`part` tables with
+  `session_v2`/`session_message` in `opencode.db`, and only ccusage 20.0.21 and later read it;
+  20.0.19 and 20.0.20 read tables OpenCode v2.0 no longer writes. A device whose `ccusage@^20.0.22`
+  degraded to an exact pin (a `^` is `cmd.exe`'s escape character, so an unquoted range on the
+  Windows npm path becomes `ccusage@20.0.19`) synced OpenCode as "synced" with a history that ended
+  weeks early: against a real v2.0.28 database, 19.3M tokens on 2026-10-11 where the database holds
+  102.8M, no 2026-10-12 or 2026-10-13 at all, and $255 of spend where the logs hold $551. The
+  check runs once per sync rather than per source, reads `ccusage --version` over the same runner
+  chain as the reports, and passes when the version cannot be read, so a ccusage that does not
+  implement `--version` still syncs.
+
 ### Server
 
 - The API now rejects implausible usage at ingest, for every CLI version. A row (device, day,
