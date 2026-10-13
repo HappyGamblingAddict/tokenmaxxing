@@ -7,6 +7,12 @@ All notable changes to tokenmaxxing are documented here. Versions are anchored t
 
 ### Changed
 
+- A source's daily and session reports now run together instead of one after the other. They read
+  the same corpus, and the session one only supplies a count the daily result does not carry, so
+  together they cost one pass over the logs instead of two: OpenCode 13.0s -> 8.7s, identical
+  output. A source with no usage now also runs a session report whose count is discarded, which is
+  a few hundred milliseconds inside the source pool; no rows and no session count are uploaded for
+  it.
 - A foreground `sync` now collects its sources concurrently, up to four at a time (half the
   machine's parallelism, capped at four), instead of one after another. Each source is an
   independent ccusage process reading its own logs, so nothing was shared between them; results

@@ -1086,20 +1086,32 @@ describe("sync source outcomes", () => {
       },
       interactive: false,
     });
+    // The session report runs alongside the daily one so a source with a long
+    // history is read once instead of twice, which means it runs here too and
+    // its count is thrown away. What must not happen is a session count
+    // reaching the server for a source with no usage.
+    const sessionCalls: string[] = [];
     const result = await Effect.runPromise(
       syncProgram(
         { dryRun: true, json: true, sources: "codex" },
         {
           runDailyReport: () => Effect.succeed({ daily: [] }),
-          runSessionReport: () => Effect.die("session report should not run"),
+          runSessionReport: (source) => {
+            sessionCalls.push(source.source);
+            return Effect.succeed({ sessions: [{}, {}] });
+          },
         },
       ).pipe(Effect.provide(layer)),
     );
 
     expect(result.status).toBe("ok");
+    expect(sessionCalls).toEqual(["codex"]);
     expect(result.sourceResults).toEqual([
       { reason: "no_data", source: "codex", status: "skipped", summary: null },
     ]);
+    // Discarded: no rows, and no session count for a source with no usage.
+    expect(result.rows).toBe(0);
+    expect(result.sources.codex).toBeNull();
   });
 });
 
