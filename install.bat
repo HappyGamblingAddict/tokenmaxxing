@@ -56,6 +56,10 @@ call bun install --cwd "%SOURCE_DIR%" --frozen-lockfile
 if errorlevel 1 goto :failed
 
 echo Building the local CLI...
+rem Run the build through bun rather than npm: npm's script runner resolves
+rem the `&&` and quoting in the build script differently, and the Windows
+rem shim it emits for `tokenmaxxing` needs a POSIX `chmod` the build no
+rem longer calls.
 call bun run --cwd "%SOURCE_DIR%\apps\cli" build
 if errorlevel 1 goto :failed
 

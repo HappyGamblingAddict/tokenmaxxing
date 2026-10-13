@@ -30,7 +30,7 @@
   "scripts": {
     "prepack": "bun run build",
     "cli": "TOKENMAXXING_ENV=development bun src/index.ts",
-    "build": "bun build src/index.ts --target node --outfile dist/index.js && chmod +x dist/index.js",
+    "build": "bun build src/index.ts --target node --outfile dist/index.js && bun -e \"import{chmodSync}from'node:fs';chmodSync('dist/index.js',0o755)\"",
     "build:native-packages": "bun script/build-native-packages.ts",
     "publish:release": "bun script/publish.ts"
   },

@@ -2,8 +2,8 @@ name: CI
 
 on:
   pull_request:
-  # Pushes to main run these checks via deploy.yml, which gates the deploy on
-  # them; a separate push trigger here would just run them twice.
+  push:
+    branches: [main]
   workflow_call:
 
 permissions:
@@ -11,8 +11,9 @@ permissions:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  # Only cancel superseded PR runs; a main run gates a deploy.
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  # Cancel superseded runs in both cases: this fork has no deploy gated on
+  # them, and the install path builds from main.
+  cancel-in-progress: true
 
 jobs:
   checks:
